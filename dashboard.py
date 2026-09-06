@@ -43,13 +43,78 @@ def fetch_trades():
             return pd.DataFrame()
     return pd.DataFrame()
 
+# دالة رسم قسم قوة العملات والترابط
+def render_currency_strength_section(df_trades):
+    st.subheader("📊 مؤشر قوة العملات والترابط المالي (Currency Strength & Correlation)")
+    st.markdown("تحليل تقاطع السيولة وقوة العملات الرئيسية لحماية شبكة التداول من الـ Drawdown.")
+
+    # 1. قياس قوة العملات افتراضياً (يمكن ربطها ببيانات حية مستقبلاً)
+    strength_scores = {
+        'USD': 78,
+        'EUR': 45,
+        'GBP': 62,
+        'JPY': 25,
+        'BTC': 88,
+        'AUD': 50,
+        'CAD': 55
+    }
+
+    df_strength = pd.DataFrame(list(strength_scores.items()), columns=['Currency', 'Strength'])
+    df_strength = df_strength.sort_values(by='Strength', ascending=True)
+
+    c1, c2 = st.columns([1, 1])
+
+    with c1:
+        st.write("##### 🟢 مؤشر قوة العملات الحالية (0 - 100)")
+        fig_bar = px.bar(
+            df_strength,
+            x='Strength',
+            y='Currency',
+            orientation='h',
+            color='Strength',
+            color_continuous_scale='RdYlGn',
+            text='Strength',
+            title="مقياس قوة العملات (Relative Currency Strength)"
+        )
+        fig_bar.update_layout(xaxis_range=[0, 100], showlegend=False, height=380)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    with c2:
+        st.write("##### 🔗 خريطة الترابط بين الأزواج (Correlation Heatmap)")
+        
+        # مصفوفة ترابط للأزواج الرئيسية
+        symbols = ['EURUSD', 'GBPUSD', 'USDJPY', 'EURGBP', 'BTCUSD']
+        corr_matrix = [
+            [1.00,  0.82, -0.75,  0.35, -0.20],  # EURUSD
+            [0.82,  1.00, -0.68, -0.25, -0.15],  # GBPUSD
+            [-0.75, -0.68,  1.00, -0.10,  0.30],  # USDJPY
+            [0.35, -0.25, -0.10,  1.00, -0.05],  # EURGBP
+            [-0.20, -0.15,  0.30, -0.05,  1.00]   # BTCUSD
+        ]
+
+        fig_heatmap = px.imshow(
+            corr_matrix,
+            x=symbols,
+            y=symbols,
+            color_continuous_scale='Viridis',
+            text_auto=True,
+            title="مصفوفة معامل الارتباط بين الأزواج"
+        )
+        fig_heatmap.update_layout(height=380)
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+
 # ==================== الشريط الجانبي ====================
 st.sidebar.title("🤖 Cloud Trading AI")
 st.sidebar.markdown("---")
 st.sidebar.metric(label="حالة السيرفر (Render)", value="Online 🟢")
 st.sidebar.metric(label="قاعدة البيانات (Neon)", value="Connected ⚡")
 
-page = st.sidebar.radio("الانتقال إلى:", ["لوحة التحكم العامة", "تحليلات الصفقات", "حاسبة الذكاء الاصطناعي"])
+page = st.sidebar.radio("الانتقال إلى:", [
+    "لوحة التحكم العامة", 
+    "تحليلات الصفقات", 
+    "قوة العملات والترابط", 
+    "حاسبة الذكاء الاصطناعي"
+])
 
 # ==================== الصفحة الأولى: لوحة التحكم العامة ====================
 if page == "لوحة التحكم العامة":
@@ -108,11 +173,17 @@ elif page == "تحليلات الصفقات":
     
     df_trades = fetch_trades()
     if not df_trades.empty:
-        st.dataframe(df_trades)
+        st.dataframe(df_trades, use_container_width=True)
     else:
         st.info("لا توجد بيانات كافية لإجراء التحليل العميق بعد.")
 
-# ==================== الصفحة الثالثة: حاسبة الذكاء الاصطناعي ====================
+# ==================== الصفحة الثالثة: قوة العملات والترابط ====================
+elif page == "قوة العملات والترابط":
+    st.title("🌐 تحليلات السوق المتقاطعة (Multi-Symbol Analysis)")
+    df_trades = fetch_trades()
+    render_currency_strength_section(df_trades)
+
+# ==================== الصفحة الرابعة: حاسبة الذكاء الاصطناعي ====================
 elif page == "حاسبة الذكاء الاصطناعي":
     st.title("🤖 اختبر توصيات Gemini مباشرة")
     st.write("قم بإدخال بيانات السوق للاختبار المباشر لحساب مسافات الـ Grid:")
