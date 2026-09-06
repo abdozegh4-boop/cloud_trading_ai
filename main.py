@@ -13,14 +13,14 @@ load_dotenv()
 
 app = FastAPI(title="Cloud Trading AI Backend")
 
-# اسم النموذج الجديد والمعتمد
-GEMINI_MODEL = "gemini-2.5-flash"
+# 🎯 استخدام النموذج المطلوب والمعتمد: gemini-3.6-flash
+GEMINI_MODEL = "gemini-3.6-flash"
 
 # إعداد كائن الاتصال بـ Gemini AI
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
-# رابط قاعدة البيانات
+# رابط قاعدة البيانات Neon PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection():
