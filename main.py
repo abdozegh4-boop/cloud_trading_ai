@@ -13,14 +13,16 @@ load_dotenv()
 
 app = FastAPI(title="Cloud Trading AI Backend")
 
-# إعداد كائن الاتصال بـ Gemini AI (المكتبة الجديدة google-genai)
+# اسم النموذج الجديد والمعتمد
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# إعداد كائن الاتصال بـ Gemini AI
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
 # رابط قاعدة البيانات
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# دالة الاتصال بقاعدة بيانات Neon PostgreSQL
 def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -32,14 +34,12 @@ def get_db_connection():
 
 # ==================== نماذج البيانات (Pydantic Models) ====================
 
-# 1. نموذج حساب شبكة زوج واحد
 class NewsPayload(BaseModel):
     headline: str
     symbol: str
     atr: float
     volume_ratio: float
 
-# 2. نماذج تحليل الترابط المتعدد (Bulk Correlated Grid)
 class SymbolSnapshot(BaseModel):
     symbol: str
     price: float
@@ -51,7 +51,6 @@ class BulkMarketRequest(BaseModel):
     headline: Optional[str] = "Market Correlation Scan"
     market_snapshot: List[SymbolSnapshot]
 
-# 3. نماذج تسجيل الصفقات في Neon DB
 class TradeOpenRequest(BaseModel):
     position_id: str
     symbol: str
@@ -64,7 +63,6 @@ class TradeCloseRequest(BaseModel):
     close_price: float
     profit: float
 
-# 4. نموذج تحديث الأسعار الحية من cBot
 class PriceUpdate(BaseModel):
     symbol: str
     bid: float
@@ -76,7 +74,11 @@ class PriceUpdate(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "Cloud Trading AI Backend operational"}
+    return {
+        "status": "online", 
+        "message": "Cloud Trading AI Backend operational",
+        "active_model": GEMINI_MODEL
+    }
 
 
 # 1️⃣ حساب إعدادات الـ Grid لزوج واحد
@@ -97,7 +99,7 @@ def calculate_grid_params(data: NewsPayload):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         text = response.text.strip().replace("```json", "").replace("```", "")
@@ -112,7 +114,7 @@ def calculate_grid_params(data: NewsPayload):
         }
 
 
-# 2️⃣ حساب ترابط الأزواج المتقاطعة وقوة العملات (Bulk Correlated Grid)
+# 2️⃣ حساب ترابط الأزواج المتقاطعة (Bulk Correlated Grid)
 @app.post("/api/calculate-correlated-grid")
 @app.post("/calculate-correlated-grid")
 def calculate_correlated_grid(data: BulkMarketRequest):
@@ -154,7 +156,7 @@ def calculate_correlated_grid(data: BulkMarketRequest):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         raw_text = response.text.strip()
