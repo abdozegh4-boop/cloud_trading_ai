@@ -7,10 +7,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 
+# استيراد أداة التحديث التلقائي
+from streamlit_autorefresh import st_autorefresh
+
 # تحميل المتغيرات البيئية
 load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 # إعدادات الصفحة
 st.set_page_config(
@@ -19,6 +20,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# 🔄 إعادة تنشيط الصفحة تلقائياً كل 10 ثوانٍ (10000 مللي ثانية)
+st_autorefresh(interval=10000, key="live_market_refresh")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # الاتصال بقاعدة البيانات
 @st.cache_resource
@@ -56,11 +62,10 @@ def fetch_live_prices():
 
 # 2️⃣ خوارزمية حساب قوة العملة الحقيقية بناءً على أداء الأزواج
 def calculate_real_strength(df_prices):
-    # قيم افتراضية محايدة (50 من 100)
     base_scores = {'USD': 50.0, 'EUR': 50.0, 'GBP': 50.0, 'JPY': 50.0, 'AUD': 50.0, 'CAD': 50.0, 'CHF': 50.0, 'BTC': 50.0}
     
     if df_prices.empty or 'change_pct' not in df_prices.columns:
-        return pd.DataFrame(list(base_scores.items()), columns=['Currency', 'Strength'])
+        return pd.DataFrame(list(base_scores.items()), columns=['Currency', 'Strength']).sort_values(by='Strength', ascending=True)
     
     for _, row in df_prices.iterrows():
         symbol = str(row['symbol']).upper()
