@@ -11,9 +11,9 @@ from google import genai
 # تحميل المتغيرات البيئية
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Cloud Trading AI Backend")
 
-# إعداد كائن الاتصال بـ Gemini AI
+# إعداد كائن الاتصال بـ Gemini AI (المكتبة الجديدة google-genai)
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
@@ -32,14 +32,12 @@ def get_db_connection():
 
 # ==================== نماذج البيانات (Pydantic Models) ====================
 
-# 1. نموذج الاستدعاء الفردي القديم
 class NewsPayload(BaseModel):
     headline: str
     symbol: str
     atr: float
     volume_ratio: float
 
-# 2. نماذج تحليل الترابط المتعدد (Bulk Correlated Grid)
 class SymbolSnapshot(BaseModel):
     symbol: str
     price: float
@@ -51,7 +49,6 @@ class BulkMarketRequest(BaseModel):
     headline: Optional[str] = "Market Correlation Scan"
     market_snapshot: List[SymbolSnapshot]
 
-# 3. نماذج تسجيل الصفقات في Neon DB
 class TradeOpenRequest(BaseModel):
     position_id: str
     symbol: str
@@ -64,6 +61,12 @@ class TradeCloseRequest(BaseModel):
     close_price: float
     profit: float
 
+class PriceUpdate(BaseModel):
+    symbol: str
+    bid: float
+    ask: float
+    change_pct: float = 0.0
+
 
 # ==================== نقاط الاتصال (Endpoints) ====================
 
@@ -72,7 +75,7 @@ def read_root():
     return {"status": "online", "message": "Cloud Trading AI Backend operational"}
 
 
-# 1️⃣ حساب إعدادات الـ Grid لزوج واحد (القديمة)
+# 1️⃣ حساب إعدادات الـ Grid لزوج واحد
 @app.post("/api/calculate-grid-params")
 def calculate_grid_params(data: NewsPayload):
     prompt = f"""
@@ -89,7 +92,7 @@ def calculate_grid_params(data: NewsPayload):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
         )
         text = response.text.strip().replace("```json", "").replace("```", "")
@@ -145,7 +148,7 @@ def calculate_correlated_grid(data: BulkMarketRequest):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
         )
         raw_text = response.text.strip()
@@ -165,8 +168,9 @@ def calculate_correlated_grid(data: BulkMarketRequest):
         }
 
 
-# 3️⃣ تسجيل فتح صفقة جديدة في Neon DB
+# 3️⃣ تسجيل فتح صفقة جديدة في Neon DB (يدعم المسارين لتفادي خطأ 404)
 @app.post("/api/trades/open")
+@app.post("/trades/open")
 def record_open_trade(trade: TradeOpenRequest):
     conn = get_db_connection()
     if not conn:
@@ -183,17 +187,17 @@ def record_open_trade(trade: TradeOpenRequest):
         )
         conn.commit()
         cur.close()
-        conn.close()
         return {"status": "success", "message": "Trade logged successfully"}
     except Exception as e:
-        if conn:
-            conn.rollback()
-            conn.close()
+        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
 
-# 4️⃣ تسجيل إغلاق الصفقة وتحديث الربح في Neon DB
+# 4️⃣ تسجيل إغلاق الصفقة في Neon DB (يدعم المسارين لتفادي خطأ 404)
 @app.post("/api/trades/close")
+@app.post("/trades/close")
 def record_close_trade(trade: TradeCloseRequest):
     conn = get_db_connection()
     if not conn:
@@ -211,10 +215,40 @@ def record_close_trade(trade: TradeCloseRequest):
         )
         conn.commit()
         cur.close()
-        conn.close()
         return {"status": "success", "message": "Trade close logged successfully"}
     except Exception as e:
-        if conn:
-            conn.rollback()
-            conn.close()
+        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# 5️⃣ تحديث الأسعار الحية من cBot (يدعم المسارين لتفادي خطأ 404)
+@app.post("/api/update-price")
+@app.post("/update-price")
+def update_price(data: PriceUpdate):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        cur = conn.cursor()
+        query = """
+            INSERT INTO symbol_prices (symbol, bid, ask, change_pct, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (symbol) 
+            DO UPDATE SET 
+                bid = EXCLUDED.bid, 
+                ask = EXCLUDED.ask, 
+                change_pct = EXCLUDED.change_pct, 
+                updated_at = NOW();
+        """
+        cur.execute(query, (data.symbol, data.bid, data.ask, data.change_pct))
+        conn.commit()
+        cur.close()
+        return {"status": "success", "message": f"Price updated for {data.symbol}"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
