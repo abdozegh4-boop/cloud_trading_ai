@@ -32,12 +32,14 @@ def get_db_connection():
 
 # ==================== نماذج البيانات (Pydantic Models) ====================
 
+# 1. نموذج حساب شبكة زوج واحد
 class NewsPayload(BaseModel):
     headline: str
     symbol: str
     atr: float
     volume_ratio: float
 
+# 2. نماذج تحليل الترابط المتعدد (Bulk Correlated Grid)
 class SymbolSnapshot(BaseModel):
     symbol: str
     price: float
@@ -49,6 +51,7 @@ class BulkMarketRequest(BaseModel):
     headline: Optional[str] = "Market Correlation Scan"
     market_snapshot: List[SymbolSnapshot]
 
+# 3. نماذج تسجيل الصفقات في Neon DB
 class TradeOpenRequest(BaseModel):
     position_id: str
     symbol: str
@@ -61,6 +64,7 @@ class TradeCloseRequest(BaseModel):
     close_price: float
     profit: float
 
+# 4. نموذج تحديث الأسعار الحية من cBot
 class PriceUpdate(BaseModel):
     symbol: str
     bid: float
@@ -77,6 +81,7 @@ def read_root():
 
 # 1️⃣ حساب إعدادات الـ Grid لزوج واحد
 @app.post("/api/calculate-grid-params")
+@app.post("/calculate-grid-params")
 def calculate_grid_params(data: NewsPayload):
     prompt = f"""
     You are an expert Forex Quantitative Trader.
@@ -109,6 +114,7 @@ def calculate_grid_params(data: NewsPayload):
 
 # 2️⃣ حساب ترابط الأزواج المتقاطعة وقوة العملات (Bulk Correlated Grid)
 @app.post("/api/calculate-correlated-grid")
+@app.post("/calculate-correlated-grid")
 def calculate_correlated_grid(data: BulkMarketRequest):
     snapshot_summary = ""
     for item in data.market_snapshot:
@@ -168,7 +174,7 @@ def calculate_correlated_grid(data: BulkMarketRequest):
         }
 
 
-# 3️⃣ تسجيل فتح صفقة جديدة في Neon DB (يدعم المسارين لتفادي خطأ 404)
+# 3️⃣ تسجيل فتح صفقة جديدة في Neon DB
 @app.post("/api/trades/open")
 @app.post("/trades/open")
 def record_open_trade(trade: TradeOpenRequest):
@@ -195,7 +201,7 @@ def record_open_trade(trade: TradeOpenRequest):
         conn.close()
 
 
-# 4️⃣ تسجيل إغلاق الصفقة في Neon DB (يدعم المسارين لتفادي خطأ 404)
+# 4️⃣ تسجيل إغلاق الصفقة في Neon DB
 @app.post("/api/trades/close")
 @app.post("/trades/close")
 def record_close_trade(trade: TradeCloseRequest):
@@ -223,7 +229,7 @@ def record_close_trade(trade: TradeCloseRequest):
         conn.close()
 
 
-# 5️⃣ تحديث الأسعار الحية من cBot (يدعم المسارين لتفادي خطأ 404)
+# 5️⃣ تحديث الأسعار الحية وقوة العملات من cBot
 @app.post("/api/update-price")
 @app.post("/update-price")
 def update_price(data: PriceUpdate):
