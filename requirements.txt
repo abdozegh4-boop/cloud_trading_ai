@@ -1,10 +1,10 @@
 fastapi
 uvicorn
 psycopg2-binary
-pgvector
-google-genai
-requests
-pydantic
 python-dotenv
+google-genai
+pydantic
 streamlit
 plotly
+pandas
+requests
