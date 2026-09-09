@@ -6,6 +6,7 @@ from psycopg2.extras import RealDictCursor
 from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -17,18 +18,16 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # تحميل المتغيرات البيئية
 load_dotenv()
 
-# ==================== إعداد التطبيق والخدمات ====================
-
-app = FastAPI(title="Cloud Trading AI Backend")
-
 GEMINI_MODEL = "gemini-2.5-flash"
 api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=api_key) if api_key else None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 def get_db_connection():
+    if not DATABASE_URL:
+        return None
     try:
         conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         return conn
@@ -94,7 +93,6 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # تجميع النص المدخل وتنظيفه من المسافات والرموز الغريبة
     raw_input = "".join(context.args).replace("\u200b", "").strip()
     symbols_list = [s.strip().upper() for s in raw_input.split(",") if s.strip()]
 
@@ -102,7 +100,6 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لم يتم التعرف على أزواج صالحة.")
         return
 
-    # حفظ الأزواج في قاعدة البيانات Neon DB
     conn = get_db_connection()
     if conn:
         try:
@@ -122,9 +119,50 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            await update.message.reply_text(f"⚠️ تم تحديد الرموز محلياً ولكن حدث خطأ أثناء الحفظ في قاعدة البيانات: {e}")
+            await update.message.reply_text(f"⚠️ تم تحديد الرموز محلياً ولكن حدث خطأ عند الحفظ في قاعدة البيانات: {e}")
     else:
-        await update.message.reply_text(f"✅ تم استقبال الرموز: `{', '.join(symbols_list)}` (لم يتم الحفظ: لا يوجد اتصال بقاعدة البيانات).", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ تم استقبال الرموز: `{', '.join(symbols_list)}` (لم يتم الحفظ: لا يوجد اتصال بقاعدة البيانات).",
+            parse_mode="Markdown"
+        )
+
+
+# ==================== إدارة دورة حياة التطبيق (Lifespan Manager) ====================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # كود الإقلاع (Startup)
+    bot_task = None
+    if TELEGRAM_BOT_TOKEN:
+        print("🤖 Initializing Telegram Bot...")
+        try:
+            telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+            telegram_app.add_handler(CommandHandler("start", cmd_start))
+            telegram_app.add_handler(CommandHandler("status", cmd_status))
+            telegram_app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
+
+            await telegram_app.initialize()
+            await telegram_app.start()
+            
+            # تشغيل الـ Polling بشكل منفصل في الخلفية لمنع تعليق السيرفر
+            bot_task = asyncio.create_task(telegram_app.updater.start_polling())
+            print("🚀 Telegram Bot is polling...")
+        except Exception as e:
+            print(f"❌ Failed to start Telegram Bot: {e}")
+    else:
+        print("⚠️ TELEGRAM_BOT_TOKEN missing in environment variables.")
+
+    yield  # السيرفر يعمل هنا ويستقبل الطلبات
+
+    # كود الإيقاف (Shutdown)
+    if TELEGRAM_BOT_TOKEN and 'telegram_app' in locals():
+        print("🛑 Stopping Telegram Bot...")
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+
+app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
 
 
 # ==================== FastAPI Endpoints ====================
@@ -140,6 +178,8 @@ def read_root():
 @app.post("/api/calculate-grid-params")
 @app.post("/calculate-grid-params")
 def calculate_grid_params(data: NewsPayload):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing")
     prompt = f"""
     You are an expert Forex Quantitative Trader.
     Analyze market conditions:
@@ -170,6 +210,8 @@ def calculate_grid_params(data: NewsPayload):
 @app.post("/api/calculate-correlated-grid")
 @app.post("/calculate-correlated-grid")
 def calculate_correlated_grid(data: BulkMarketRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing")
     snapshot_summary = "".join([
         f"- Symbol: {item.symbol} | Price: {item.price} | Change: {item.change_pct}% | ATR: {item.atr_pips} pips\n"
         for item in data.market_snapshot
@@ -279,25 +321,3 @@ def update_price(data: PriceUpdate):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
-
-
-# ==================== تشغيل بوت التلغرام عند إقلاع السيرفر ====================
-
-@app.on_event("startup")
-async def startup_event():
-    if TELEGRAM_BOT_TOKEN:
-        print("🤖 Initializing Telegram Bot...")
-        telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-        # تسجيل الأوامر
-        telegram_app.add_handler(CommandHandler("start", cmd_start))
-        telegram_app.add_handler(CommandHandler("status", cmd_status))
-        telegram_app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
-
-        # تشغيل البوت في الخلفية (Background Task)
-        await telegram_app.initialize()
-        await telegram_app.start()
-        await telegram_app.updater.start_polling()
-        print("🚀 Telegram Bot is polling...")
-    else:
-        print("⚠️ TELEGRAM_BOT_TOKEN missing in environment variables.")
