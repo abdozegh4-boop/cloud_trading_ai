@@ -1,11 +1,7 @@
 fastapi
 uvicorn
-psycopg2-binary
 python-dotenv
 google-genai
+psycopg2-binary
+python-telegram-bot
 pydantic
-streamlit
-plotly
-pandas
-requests
-streamlit-autorefresh
