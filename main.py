@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Optional
@@ -9,20 +10,23 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
+# مكتبات التلغرام
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
 # تحميل المتغيرات البيئية
 load_dotenv()
 
+# ==================== إعداد التطبيق والخدمات ====================
+
 app = FastAPI(title="Cloud Trading AI Backend")
 
-# 🎯 اسم النموذج المعتمد
 GEMINI_MODEL = "gemini-2.5-flash"
-
-# إعداد كائن الاتصال بـ Gemini AI
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
-# رابط قاعدة البيانات Neon PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 def get_db_connection():
     try:
@@ -71,7 +75,59 @@ class PriceUpdate(BaseModel):
     change_pct: float = 0.0
 
 
-# ==================== نقاط الاتصال (Endpoints) ====================
+# ==================== أوامر بوت التلغرام (Telegram Handlers) ====================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 أهلاً بك! بوت التداول السحابي متصل ويعمل بنجاح.")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🟢 الحالة: السيرفر يعمل بشكل طبيعي والاتصال بنشاط.")
+
+async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    معالجة الأمر: /set_symbols EURUSD,GBPUSD,XAUUSD
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "❌ صيغة غير صحيحة.\nيرجى كتابة الأزواج بعد الأمر مباشرة كالتالي:\n`/set_symbols EURUSD,GBPUSD,XAUUSD`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # تجميع النص المدخل وتنظيفه من المسافات والرموز الغريبة
+    raw_input = "".join(context.args).replace("\u200b", "").strip()
+    symbols_list = [s.strip().upper() for s in raw_input.split(",") if s.strip()]
+
+    if not symbols_list:
+        await update.message.reply_text("❌ لم يتم التعرف على أزواج صالحة.")
+        return
+
+    # حفظ الأزواج في قاعدة البيانات Neon DB
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            symbols_str = ",".join(symbols_list)
+            cur.execute("""
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES ('active_symbols', %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+            """, (symbols_str,))
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            await update.message.reply_text(
+                f"✅ **تم تحديث الرموز المستهدفة بنجاح:**\n`{', '.join(symbols_list)}`",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ تم تحديد الرموز محلياً ولكن حدث خطأ أثناء الحفظ في قاعدة البيانات: {e}")
+    else:
+        await update.message.reply_text(f"✅ تم استقبال الرموز: `{', '.join(symbols_list)}` (لم يتم الحفظ: لا يوجد اتصال بقاعدة البيانات).", parse_mode="Markdown")
+
+
+# ==================== FastAPI Endpoints ====================
 
 @app.get("/")
 def read_root():
@@ -81,8 +137,6 @@ def read_root():
         "active_model": GEMINI_MODEL
     }
 
-
-# 1️⃣ حساب إعدادات الـ Grid لزوج واحد
 @app.post("/api/calculate-grid-params")
 @app.post("/calculate-grid-params")
 def calculate_grid_params(data: NewsPayload):
@@ -102,12 +156,9 @@ def calculate_grid_params(data: NewsPayload):
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+            config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        result = json.loads(response.text)
-        return result
+        return json.loads(response.text)
     except Exception as e:
         base_grid = int(data.atr * 10000 * 1.5) if data.atr > 0 else 20
         return {
@@ -116,14 +167,13 @@ def calculate_grid_params(data: NewsPayload):
             "error_fallback": str(e)
         }
 
-
-# 2️⃣ حساب ترابط الأزواج المتقاطعة (Bulk Correlated Grid)
 @app.post("/api/calculate-correlated-grid")
 @app.post("/calculate-correlated-grid")
 def calculate_correlated_grid(data: BulkMarketRequest):
-    snapshot_summary = ""
-    for item in data.market_snapshot:
-        snapshot_summary += f"- Symbol: {item.symbol} | Price: {item.price} | Change: {item.change_pct}% | ATR: {item.atr_pips} pips\n"
+    snapshot_summary = "".join([
+        f"- Symbol: {item.symbol} | Price: {item.price} | Change: {item.change_pct}% | ATR: {item.atr_pips} pips\n"
+        for item in data.market_snapshot
+    ])
 
     prompt = f"""
     You are an expert AI Risk Manager and Quantitative Grid Trading Strategist.
@@ -133,19 +183,10 @@ def calculate_correlated_grid(data: BulkMarketRequest):
 
     Global Market Event / News Context: {data.headline}
 
-    Your Analysis Tasks:
-    1. Determine current Currency/Asset Strength & Weakness across the dataset.
-    2. Detect inter-market correlation risks (e.g., strong USD rallying affecting all pairs simultaneously).
-    3. For EVERY symbol listed in the snapshot, determine optimal Grid parameters that protect against drawdown:
-       - `grid_spacing_pips`: Spacing between grid orders in pips.
-       - `basket_tp_pips`: Target cumulative profit for the grid basket in pips.
-       - `risk_mode`: Options: "CONSERVATIVE", "BALANCED", or "AGGRESSIVE".
-       - `bias`: Market bias for the pair ("BUY", "SELL", or "NEUTRAL").
-
     STRICT RESPONSE FORMAT:
     Return ONLY a valid JSON object matching this structure:
     {{
-      "currency_strength_summary": "Brief analysis of overall market strength/weakness",
+      "currency_strength_summary": "Brief analysis",
       "symbols_config": {{
         "EURUSD": {{
           "grid_spacing_pips": 25,
@@ -160,29 +201,18 @@ def calculate_correlated_grid(data: BulkMarketRequest):
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+            config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        json_data = json.loads(response.text)
-        return {"status": "success", "data": json_data}
-
+        return {"status": "success", "data": json.loads(response.text)}
     except Exception as e:
-        return {
-            "status": "warning",
-            "message": "AI calculation failed, fallback applied.",
-            "error": str(e)
-        }
+        return {"status": "warning", "message": "AI calculation failed", "error": str(e)}
 
-
-# 3️⃣ تسجيل فتح صفقة جديدة في Neon DB
 @app.post("/api/trades/open")
 @app.post("/trades/open")
 def record_open_trade(trade: TradeOpenRequest):
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-    
     try:
         cur = conn.cursor()
         cur.execute(
@@ -201,15 +231,12 @@ def record_open_trade(trade: TradeOpenRequest):
     finally:
         conn.close()
 
-
-# 4️⃣ تسجيل إغلاق الصفقة في Neon DB
 @app.post("/api/trades/close")
 @app.post("/trades/close")
 def record_close_trade(trade: TradeCloseRequest):
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-    
     try:
         cur = conn.cursor()
         cur.execute(
@@ -229,26 +256,19 @@ def record_close_trade(trade: TradeCloseRequest):
     finally:
         conn.close()
 
-
-# 5️⃣ تحديث الأسعار الحية وقوة العملات من cBot
 @app.post("/api/update-price")
 @app.post("/update-price")
 def update_price(data: PriceUpdate):
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-    
     try:
         cur = conn.cursor()
         query = """
             INSERT INTO symbol_prices (symbol, bid, ask, change_pct, updated_at)
             VALUES (%s, %s, %s, %s, NOW())
             ON CONFLICT (symbol) 
-            DO UPDATE SET 
-                bid = EXCLUDED.bid, 
-                ask = EXCLUDED.ask, 
-                change_pct = EXCLUDED.change_pct, 
-                updated_at = NOW();
+            DO UPDATE SET bid = EXCLUDED.bid, ask = EXCLUDED.ask, change_pct = EXCLUDED.change_pct, updated_at = NOW();
         """
         cur.execute(query, (data.symbol, data.bid, data.ask, data.change_pct))
         conn.commit()
@@ -259,3 +279,25 @@ def update_price(data: PriceUpdate):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+
+# ==================== تشغيل بوت التلغرام عند إقلاع السيرفر ====================
+
+@app.on_event("startup")
+async def startup_event():
+    if TELEGRAM_BOT_TOKEN:
+        print("🤖 Initializing Telegram Bot...")
+        telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+        # تسجيل الأوامر
+        telegram_app.add_handler(CommandHandler("start", cmd_start))
+        telegram_app.add_handler(CommandHandler("status", cmd_status))
+        telegram_app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
+
+        # تشغيل البوت في الخلفية (Background Task)
+        await telegram_app.initialize()
+        await telegram_app.start()
+        await telegram_app.updater.start_polling()
+        print("🚀 Telegram Bot is polling...")
+    else:
+        print("⚠️ TELEGRAM_BOT_TOKEN missing in environment variables.")
