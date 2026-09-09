@@ -35,6 +35,26 @@ def get_db_connection():
         print(f"Database connection error: {e}")
         return None
 
+def init_db():
+    """إنشاء الجدول تلقائياً في قاعدة البيانات إذا لم يكن موجوداً"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            print("✅ Database tables initialized successfully.")
+        except Exception as e:
+            print(f"❌ Error initializing database tables: {e}")
+
 
 # ==================== نماذج البيانات (Pydantic Models) ====================
 
@@ -83,9 +103,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🟢 الحالة: السيرفر يعمل بشكل طبيعي والاتصال بنشاط.")
 
 async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    معالجة الأمر: /set_symbols EURUSD,GBPUSD,XAUUSD
-    """
     if not context.args:
         await update.message.reply_text(
             "❌ صيغة غير صحيحة.\nيرجى كتابة الأزواج بعد الأمر مباشرة كالتالي:\n`/set_symbols EURUSD,GBPUSD,XAUUSD`",
@@ -115,11 +132,11 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             
             await update.message.reply_text(
-                f"✅ **تم تحديث الرموز المستهدفة بنجاح:**\n`{', '.join(symbols_list)}`",
+                f"✅ **تم تحديث الرموز المستهدفة وحفظها بنجاح:**\n`{', '.join(symbols_list)}`",
                 parse_mode="Markdown"
             )
         except Exception as e:
-            await update.message.reply_text(f"⚠️ تم تحديد الرموز محلياً ولكن حدث خطأ عند الحفظ في قاعدة البيانات: {e}")
+            await update.message.reply_text(f"⚠️ حدث خطأ عند الحفظ في قاعدة البيانات: {e}")
     else:
         await update.message.reply_text(
             f"✅ تم استقبال الرموز: `{', '.join(symbols_list)}` (لم يتم الحفظ: لا يوجد اتصال بقاعدة البيانات).",
@@ -131,7 +148,9 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # كود الإقلاع (Startup)
+    # إنشاء الجداول عند الإقلاع
+    init_db()
+
     bot_task = None
     if TELEGRAM_BOT_TOKEN:
         print("🤖 Initializing Telegram Bot...")
@@ -144,7 +163,6 @@ async def lifespan(app: FastAPI):
             await telegram_app.initialize()
             await telegram_app.start()
             
-            # تشغيل الـ Polling بشكل منفصل في الخلفية لمنع تعليق السيرفر
             bot_task = asyncio.create_task(telegram_app.updater.start_polling())
             print("🚀 Telegram Bot is polling...")
         except Exception as e:
@@ -152,9 +170,8 @@ async def lifespan(app: FastAPI):
     else:
         print("⚠️ TELEGRAM_BOT_TOKEN missing in environment variables.")
 
-    yield  # السيرفر يعمل هنا ويستقبل الطلبات
+    yield
 
-    # كود الإيقاف (Shutdown)
     if TELEGRAM_BOT_TOKEN and 'telegram_app' in locals():
         print("🛑 Stopping Telegram Bot...")
         await telegram_app.updater.stop()
