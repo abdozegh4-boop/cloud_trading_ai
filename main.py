@@ -7,14 +7,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google import genai
+from google.genai import types
 
 # تحميل المتغيرات البيئية
 load_dotenv()
 
 app = FastAPI(title="Cloud Trading AI Backend")
 
-# 🎯 استخدام النموذج المطلوب والمعتمد: gemini-3.6-flash
-GEMINI_MODEL = "gemini-3.6-flash"
+# 🎯 اسم النموذج المعتمد
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # إعداد كائن الاتصال بـ Gemini AI
 api_key = os.getenv("GEMINI_API_KEY")
@@ -94,16 +95,18 @@ def calculate_grid_params(data: NewsPayload):
     - Volume Ratio: {data.volume_ratio}
 
     Provide recommended Grid spacing in pips and Basket Take-Profit in pips.
-    Return ONLY raw JSON with format:
+    Return ONLY JSON with structure:
     {{"recommended_grid_pips": int, "recommended_basket_tp": int}}
     """
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
         )
-        text = response.text.strip().replace("```json", "").replace("```", "")
-        result = json.loads(text)
+        result = json.loads(response.text)
         return result
     except Exception as e:
         base_grid = int(data.atr * 10000 * 1.5) if data.atr > 0 else 20
@@ -140,8 +143,7 @@ def calculate_correlated_grid(data: BulkMarketRequest):
        - `bias`: Market bias for the pair ("BUY", "SELL", or "NEUTRAL").
 
     STRICT RESPONSE FORMAT:
-    Return ONLY a valid JSON object without any Markdown formatting or code blocks.
-    Structure:
+    Return ONLY a valid JSON object matching this structure:
     {{
       "currency_strength_summary": "Brief analysis of overall market strength/weakness",
       "symbols_config": {{
@@ -158,14 +160,11 @@ def calculate_correlated_grid(data: BulkMarketRequest):
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
         )
-        raw_text = response.text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        elif raw_text.startswith("```"):
-            raw_text = raw_text.replace("```", "").strip()
-
-        json_data = json.loads(raw_text)
+        json_data = json.loads(response.text)
         return {"status": "success", "data": json_data}
 
     except Exception as e:
