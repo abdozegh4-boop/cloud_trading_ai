@@ -1,5 +1,7 @@
 import os
 import json
+import asyncio
+import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Optional
@@ -42,6 +44,24 @@ ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN")
 ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOUNT_ID") else 0
 
 telegram_app: Optional[Application] = None
+
+# ==================== Self-Ping Task (منع الخمول) ====================
+
+async def keep_alive():
+    """وظيفة تُبقي خادم Render مستيقظاً بإرسال طلب كل 10 دقائق"""
+    await asyncio.sleep(10)  # انتظار 10 ثوان بعد إقلاع السيرفر قبل أول طلب
+    print(f"🔄 Starting Self-Ping Task targetting: {WEBHOOK_HOST}")
+    
+    async with httpx.AsyncClient() as client_http:
+        while True:
+            try:
+                response = await client_http.get(WEBHOOK_HOST, timeout=10.0)
+                print(f"🟢 Self-Ping Successful | Status Code: {response.status_code}")
+            except Exception as e:
+                print(f"⚠️ Self-Ping Failed: {e}")
+            
+            # الانتظار لمدة 10 دقائق (600 ثانية)
+            await asyncio.sleep(600)
 
 # ==================== cTrader Open API ====================
 
@@ -129,7 +149,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 أهلاً بك! بوت التداول السحابي يعمل بنجاح عبر Webhook.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 الحالة: السيرفر يعمل بوضع Webhook والاتصال بنشاط.")
+    await update.message.reply_text("🟢 الحالة: السيرفر يعمل بوضع Webhook ومهمة Self-Ping نشطة لمنع الخمول.")
 
 async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -168,6 +188,9 @@ async def lifespan(app: FastAPI):
     
     init_db()
 
+    # تشغيل مهمة منع الخمول تلقائياً
+    ping_task = asyncio.create_task(keep_alive())
+
     if CLIENT_ID and CLIENT_SECRET:
         print("🔌 Starting cTrader Open API Client...")
         try:
@@ -197,6 +220,11 @@ async def lifespan(app: FastAPI):
 
     # عند إغلاق السيرفر
     print("🛑 Stopping Services...")
+    
+    # إلغاء مهمة Self-Ping
+    ping_task.cancel()
+    print("🛑 Self-Ping Task stopped.")
+
     if telegram_app:
         try:
             print("🔗 Removing Telegram Webhook...")
