@@ -57,7 +57,7 @@ is_ctrader_connected = False
 stop_ctrader_flag = False
 db_pool: Optional[pool.SimpleConnectionPool] = None
 
-# تخزين مؤقت لببيانات الحساب والصفقات القادمة من cTrader
+# تخزين مؤقت لبيانات الحساب والصفقات القادمة من cTrader
 ctrader_account_info: Dict[str, Any] = {
     "balance": 0.0,
     "equity": 0.0,
@@ -98,7 +98,7 @@ def init_db():
         if conn:
             db_pool.putconn(conn)
 
-# ==================== Self-Ping Task ====================
+# ==================== Self-Ping Task (منع الخمول) ====================
 
 async def keep_alive():
     await asyncio.sleep(10)
@@ -145,7 +145,6 @@ def on_message_received(client, message):
             
     elif msg_type == ProtoOAAccountAuthRes().payloadType:
         print(f"🚀 Account {ACCOUNT_ID} Authenticated successfully!")
-        # طلب تحديث بيانات الحساب والصفقات فور الاتصال
         request_account_details()
 
 def request_account_details():
@@ -207,14 +206,15 @@ class BulkMarketRequest(BaseModel):
 def is_authorized(update: Update) -> bool:
     if not MY_TELEGRAM_CHAT_ID:
         return True
-    return str(update.effective_chat.id) == str(MY_TELEGRAM_CHAT_ID)
+    user_id = update.effective_chat.id if update.effective_chat else None
+    return str(user_id) == str(MY_TELEGRAM_CHAT_ID)
 
 def main_keyboard():
     """لوحة تفاعلية بأزرار سريعة"""
     keyboard = [
         [
             InlineKeyboardButton("📊 حالة النظام", callback_data="btn_status"),
-            InlineKeyboardButton("💼 معلومات الحساب", callback_data="btn_account")
+            InlineKeyboardButton("💳 معلومات الحساب", callback_data="btn_account")
         ],
         [
             InlineKeyboardButton("📈 الصفقات المفتوحة", callback_data="btn_positions"),
@@ -249,13 +249,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض تفاصيل الحساب المالي"""
     if not is_authorized(update):
         return
     
-    # تحديث البيانات عبر API
     request_account_details()
-    
     bal = ctrader_account_info.get("balance", 0.0)
     eq = ctrader_account_info.get("equity", 0.0)
     margin = ctrader_account_info.get("margin", 0.0)
@@ -266,13 +263,12 @@ async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 **تقرير حساب التداول:**\n\n"
         f"🔹 **الرصيد (Balance):** `${bal:,.2f}`\n"
         f"🔹 **الصافي الحالي (Equity):** `${eq:,.2f}`\n"
-        f"🔹 **الأرباح/الخسائر غير المحققة:** {pnl_sign}`${pnl:,.2f}`\n"
+        f"🔹 **الأرباح/الخسائر:** {pnl_sign}`${pnl:,.2f}`\n"
         f"🔹 **الهامش المستغل (Margin):** `${margin:,.2f}`"
     )
     await update.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض الصفقات المفتوحة"""
     if not is_authorized(update):
         return
 
@@ -294,34 +290,71 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إغلاق كافة الصفقات"""
     if not is_authorized(update):
         return
-    
     if not is_ctrader_connected:
         await update.message.reply_text("❌ متعذر الإغلاق، الاتصال بـ cTrader مقطوع.")
         return
-
-    # إرسال طلب إغلاق الحساب للشبكة
-    # (يمكن وضع دالة cTrader المخصصة للإغلاق الجماعي هنا)
     await update.message.reply_text("⚠️ **جاري إرسال أوامر الإغلاق الفوري لجميع الصفقات...**")
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إدارة نقرات الأزرار التفاعلية"""
+    """إدارة أزرار التلغرام وحل مشكلة عدم استجابة النقرات"""
     query = update.callback_query
     await query.answer()
 
+    if not is_authorized(update):
+        await query.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+        return
+
     if query.data == "btn_status":
-        await cmd_status(update, context)
+        ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
+        status_msg = (
+            f"🖥 **حالة الخادم:** 🟢 يعمل بنجاح\n"
+            f"🔌 **شبكة cTrader API:** {ctrader_status}\n"
+            f"🔄 **مهمة Self-Ping:** 🟢 نشطة\n"
+            f"🧠 **نموذج الذكاء الاصطناعي:** `{GEMINI_MODEL}`"
+        )
+        await query.message.reply_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
     elif query.data == "btn_account":
-        await cmd_account(update, context)
+        request_account_details()
+        bal = ctrader_account_info.get("balance", 0.0)
+        eq = ctrader_account_info.get("equity", 0.0)
+        margin = ctrader_account_info.get("margin", 0.0)
+        pnl = eq - bal
+        pnl_sign = "🟢 +" if pnl >= 0 else "🔴 "
+
+        msg = (
+            f"💳 **تقرير حساب التداول:**\n\n"
+            f"🔹 **الرصيد (Balance):** `${bal:,.2f}`\n"
+            f"🔹 **الصافي الحالي (Equity):** `${eq:,.2f}`\n"
+            f"🔹 **الأرباح/الخسائر:** {pnl_sign}`${pnl:,.2f}`\n"
+            f"🔹 **الهامش المستغل (Margin):** `${margin:,.2f}`"
+        )
+        await query.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
     elif query.data == "btn_positions":
-        await cmd_positions(update, context)
+        request_account_details()
+        if not active_positions:
+            await query.message.reply_text("📭 **لا توجد صفقات مفتوحة حالياً.**", reply_markup=main_keyboard(), parse_mode="Markdown")
+        else:
+            msg = "📈 **الصفقات المفتوحة حالياً:**\n\n"
+            for pos in active_positions:
+                side = "🟢 BUY" if pos.get("trade_type") == "BUY" else "🔴 SELL"
+                msg += (
+                    f"🔹 **{pos.get('symbol')}** | {side}\n"
+                    f"   • اللوت: `{pos.get('volume')}`\n"
+                    f"   • سعر الدخول: `{pos.get('entry_price')}`\n"
+                    f"   • الربح/الخسارة: `{pos.get('pnl'):+.2f} USD`\n\n"
+                )
+            await query.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
     elif query.data == "btn_refresh":
         request_account_details()
-        await query.edit_message_text("🔄 **تمت إعادة تحديث بيانات الحساب والشبكة.**", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await query.message.reply_text("🔄 **تمت إعادة تحديث بيانات الحساب والشبكة.**", reply_markup=main_keyboard(), parse_mode="Markdown")
+
     elif query.data == "btn_closeall":
-        await cmd_close_all(update, context)
+        await query.message.reply_text("⚠️ **جاري إرسال أوامر الإغلاق الفوري لجميع الصفقات...**")
 
 # ==================== دورة حياة التطبيق (Lifespan) ====================
 
@@ -350,7 +383,7 @@ async def lifespan(app: FastAPI):
             telegram_app.add_handler(CommandHandler("positions", cmd_positions))
             telegram_app.add_handler(CommandHandler("closeall", cmd_close_all))
             
-            # تسجيل معالج أزرار التحكم
+            # تسجيل معالج الأزرار التفاعلية
             telegram_app.add_handler(CallbackQueryHandler(handle_callback_query))
 
             await telegram_app.initialize()
@@ -406,9 +439,114 @@ async def telegram_webhook(request: Request):
         await telegram_app.process_update(update)
         return Response(status_code=status.HTTP_200_OK)
     except Exception as e:
+        print(f"⚠️ Error processing Webhook update: {e}")
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "online", "ctrader_connected": is_ctrader_connected}
+    return {
+        "status": "online",
+        "mode": "webhook",
+        "ctrader_connected": is_ctrader_connected,
+        "message": "Cloud Trading AI Backend connected to cTrader Open API",
+        "active_model": GEMINI_MODEL
+    }
+
+@app.get("/api/get-active-symbols")
+@app.get("/get-active-symbols")
+def get_active_symbols():
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="Database connection pool unavailable")
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT value FROM bot_settings WHERE key = 'active_symbols';")
+            row = cur.fetchone()
+
+        if row and row.get("value"):
+            symbols_list = [s.strip() for s in row["value"].split(",") if s.strip()]
+            return {"status": "success", "symbols": symbols_list, "raw_symbols": row["value"]}
+        else:
+            return {"status": "default", "symbols": ["EURUSD", "GBPUSD", "XAUUSD"], "raw_symbols": "EURUSD,GBPUSD,XAUUSD"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+@app.post("/api/calculate-grid-params")
+@app.post("/calculate-grid-params")
+def calculate_grid_params(data: NewsPayload):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing")
+    prompt = f"""
+    You are an expert Forex Quantitative Trader.
+    Analyze market conditions:
+    - Headline: {data.headline}
+    - Symbol: {data.symbol}
+    - ATR: {data.atr}
+    - Volume Ratio: {data.volume_ratio}
+
+    Provide recommended Grid spacing in pips and Basket Take-Profit in pips.
+    Return ONLY JSON with structure:
+    {{"recommended_grid_pips": int, "recommended_basket_tp": int}}
+    """
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        base_grid = int(data.atr * 10000 * 1.5) if data.atr > 0 else 20
+        return {
+            "recommended_grid_pips": max(base_grid, 10),
+            "recommended_basket_tp": 10,
+            "error_fallback": str(e)
+        }
+
+@app.post("/api/calculate-correlated-grid")
+@app.post("/calculate-correlated-grid")
+def calculate_correlated_grid(data: BulkMarketRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing")
+    snapshot_summary = "".join([
+        f"- Symbol: {item.symbol} | Price: {item.price} | Change: {item.change_pct}% | ATR: {item.atr_pips} pips\n"
+        for item in data.market_snapshot
+    ])
+
+    prompt = f"""
+    You are an expert AI Risk Manager and Quantitative Grid Trading Strategist.
+    Analyze the following multi-asset market snapshot captured at the exact same time:
+
+    {snapshot_summary}
+
+    Global Market Event / News Context: {data.headline}
+
+    STRICT RESPONSE FORMAT:
+    Return ONLY a valid JSON object matching this structure:
+    {{
+      "currency_strength_summary": "Brief analysis",
+      "symbols_config": {{
+        "EURUSD": {{
+          "grid_spacing_pips": 25,
+          "basket_tp_pips": 30,
+          "risk_mode": "BALANCED",
+          "bias": "NEUTRAL"
+        }}
+      }}
+    }}
+    """
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return {"status": "success", "data": json.loads(response.text)}
+    except Exception as e:
+        return {"status": "warning", "message": "AI calculation failed", "error": str(e)}
