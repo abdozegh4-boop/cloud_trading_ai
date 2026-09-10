@@ -5,3 +5,5 @@ google-genai
 psycopg2-binary
 python-telegram-bot
 pydantic
+ctrader-open-api
+twisted
