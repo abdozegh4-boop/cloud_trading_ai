@@ -192,7 +192,9 @@ async def lifespan(app: FastAPI):
 
             await telegram_app.initialize()
             await telegram_app.start()
-            asyncio.create_task(telegram_app.updater.start_polling())
+            
+            # إسقاط التحديثات المعلقة لتجنب تعارض Conflict
+            asyncio.create_task(telegram_app.updater.start_polling(drop_pending_updates=True))
             print("🚀 Telegram Bot is polling...")
         except Exception as e:
             print(f"❌ Failed to start Telegram Bot: {e}")
@@ -211,9 +213,107 @@ app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
 # ==================== FastAPI Endpoints ====================
 
 @app.get("/")
+@app.head("/")
 def read_root():
     return {
         "status": "online",
         "message": "Cloud Trading AI Backend connected to cTrader Open API",
         "active_model": GEMINI_MODEL
     }
+
+@app.get("/api/get-active-symbols")
+@app.get("/get-active-symbols")
+def get_active_symbols():
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM bot_settings WHERE key = 'active_symbols';")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row and row.get("value"):
+            symbols_list = [s.strip() for s in row["value"].split(",") if s.strip()]
+            return {"status": "success", "symbols": symbols_list, "raw_symbols": row["value"]}
+        else:
+            return {"status": "default", "symbols": ["EURUSD", "GBPUSD", "XAUUSD"], "raw_symbols": "EURUSD,GBPUSD,XAUUSD"}
+    except Exception as e:
+        if conn:
+            conn.close()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.post("/api/calculate-grid-params")
+@app.post("/calculate-grid-params")
+def calculate_grid_params(data: NewsPayload):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing")
+    prompt = f"""
+    You are an expert Forex Quantitative Trader.
+    Analyze market conditions:
+    - Headline: {data.headline}
+    - Symbol: {data.symbol}
+    - ATR: {data.atr}
+    - Volume Ratio: {data.volume_ratio}
+
+    Provide recommended Grid spacing in pips and Basket Take-Profit in pips.
+    Return ONLY JSON with structure:
+    {{"recommended_grid_pips": int, "recommended_basket_tp": int}}
+    """
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        base_grid = int(data.atr * 10000 * 1.5) if data.atr > 0 else 20
+        return {
+            "recommended_grid_pips": max(base_grid, 10),
+            "recommended_basket_tp": 10,
+            "error_fallback": str(e)
+        }
+
+@app.post("/api/calculate-correlated-grid")
+@app.post("/calculate-correlated-grid")
+def calculate_correlated_grid(data: BulkMarketRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing")
+    snapshot_summary = "".join([
+        f"- Symbol: {item.symbol} | Price: {item.price} | Change: {item.change_pct}% | ATR: {item.atr_pips} pips\n"
+        for item in data.market_snapshot
+    ])
+
+    prompt = f"""
+    You are an expert AI Risk Manager and Quantitative Grid Trading Strategist.
+    Analyze the following multi-asset market snapshot captured at the exact same time:
+
+    {snapshot_summary}
+
+    Global Market Event / News Context: {data.headline}
+
+    STRICT RESPONSE FORMAT:
+    Return ONLY a valid JSON object matching this structure:
+    {{
+      "currency_strength_summary": "Brief analysis",
+      "symbols_config": {{
+        "EURUSD": {{
+          "grid_spacing_pips": 25,
+          "basket_tp_pips": 30,
+          "risk_mode": "BALANCED",
+          "bias": "NEUTRAL"
+        }}
+      }}
+    }}
+    """
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return {"status": "success", "data": json.loads(response.text)}
+    except Exception as e:
+        return {"status": "warning", "message": "AI calculation failed", "error": str(e)}
