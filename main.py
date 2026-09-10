@@ -32,6 +32,7 @@ client = genai.Client(api_key=api_key) if api_key else None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MY_TELEGRAM_CHAT_ID = os.getenv("MY_TELEGRAM_CHAT_ID")
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrender.com")
 WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -251,6 +252,19 @@ async def lifespan(app: FastAPI):
                 max_connections=40
             )
             print("🚀 Telegram Webhook configured successfully!")
+
+            # إرسال إشعار الإقلاع للمشرف
+            if MY_TELEGRAM_CHAT_ID:
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=int(MY_TELEGRAM_CHAT_ID),
+                        text="🚀 **تم إكتمال الـ Deployment بنجاح!**\nالسيرفر، cTrader API، وبوت التداول جاهزان للعمل الآن.",
+                        parse_mode="Markdown"
+                    )
+                    print("📨 Startup notification sent to Telegram admin!")
+                except Exception as e:
+                    print(f"⚠️ Failed to send startup notification: {e}")
+
         except Exception as e:
             print(f"❌ Failed to configure Telegram Webhook: {e}")
 
