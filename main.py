@@ -96,13 +96,13 @@ def on_message_received(client, message):
         print("✅ Application Authenticated successfully.")
         if ACCOUNT_ID and ACCESS_TOKEN:
             acc_auth_req = ProtoOAAccountAuthReq()
-            # التعديل هنا: إضافة حرف 's' إلى ctradersAccountId
-            acc_auth_req.ctradersAccountId = ACCOUNT_ID
-            acc_auth_req.accessToken = ACCESS_TOKEN
+            # استخدام صيغة snake_case المعتمدة في Python Protobuf
+            acc_auth_req.ctraders_account_id = int(ACCOUNT_ID)
+            acc_auth_req.access_token = ACCESS_TOKEN
             client.send(acc_auth_req)
     elif msg_type == ProtoOAAccountAuthRes().payloadType:
         print(f"🚀 Account {ACCOUNT_ID} Authenticated successfully!")
-        
+
 ctrader_client.setConnectedCallback(on_connected)
 ctrader_client.setDisconnectedCallback(on_disconnected)
 ctrader_client.setMessageReceivedCallback(on_message_received)
