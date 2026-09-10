@@ -18,14 +18,15 @@ from google.genai import types
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-# مكتبات cTrader Open API
+# مكتبات cTrader Open API و Twisted Engine
+from twisted.internet import reactor
 from ctrader_open_api import Client, TcpProtocol
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 
 load_dotenv()
 
-# المتغيرات البيئية
+# ==================== المتغيرات البيئية ====================
 GEMINI_MODEL = "gemini-2.5-flash"
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
@@ -105,18 +106,32 @@ ctrader_client.setConnectedCallback(on_connected)
 ctrader_client.setDisconnectedCallback(on_disconnected)
 ctrader_client.setMessageReceivedCallback(on_message_received)
 
+def start_ctrader_reactor():
+    """تشغيل Twisted Reactor وتفعيل خدمة cTrader في Thread مستقل"""
+    try:
+        print("🔌 Starting cTrader Twisted Reactor...")
+        ctrader_client.startService()
+        if not reactor.running:
+            reactor.run(installSignalHandlers=False)
+    except Exception as e:
+        print(f"⚠️ cTrader Reactor Error: {e}")
+
 def ctrader_auto_reconnect_loop():
-    """مهمة خلفية في Thread مستقل تفحص الاتصال وتسعى لإعادته تلقائياً"""
+    """مهمة خلفية تفحص حالة الاتصال وتطلب إعادة الاتصال عبر Twisted Event Loop"""
     global stop_ctrader_flag, is_ctrader_connected
-    print("🔌 cTrader Auto-Reconnect Loop started in background thread.")
+    print("🔌 cTrader Monitor Loop started.")
+    
+    # تشغيل الاتصال والـ Reactor لأول مرة في Thread منفصل
+    reactor_thread = threading.Thread(target=start_ctrader_reactor, daemon=True)
+    reactor_thread.start()
     
     while not stop_ctrader_flag:
         if not is_ctrader_connected and CLIENT_ID and CLIENT_SECRET:
             print("🔄 Attempting to connect/reconnect to cTrader Open API...")
             try:
-                ctrader_client.startService()
+                reactor.callFromThread(ctrader_client.startService)
             except Exception as e:
-                print(f"⚠️ cTrader Connection Error: {e}")
+                print(f"⚠️ cTrader Reconnect Error: {e}")
         
         # فحص حالة الاتصال كل 30 ثانية
         for _ in range(30):
@@ -227,7 +242,7 @@ async def lifespan(app: FastAPI):
     # 1. تشغيل مهمة منع الخمول
     ping_task = asyncio.create_task(keep_alive())
 
-    # 2. تشغيل cTrader Auto-Reconnect في Thread مستقل
+    # 2. تشغيل cTrader Auto-Reconnect والـ Reactor في Thread مستقل
     stop_ctrader_flag = False
     if CLIENT_ID and CLIENT_SECRET:
         ctrader_thread = threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True)
@@ -287,6 +302,8 @@ async def lifespan(app: FastAPI):
 
     if CLIENT_ID and CLIENT_SECRET:
         try:
+            if reactor.running:
+                reactor.callFromThread(reactor.stop)
             ctrader_client.stopService()
             print("🛑 cTrader Client stopped.")
         except Exception as e:
