@@ -1,6 +1,8 @@
 import os
 import json
 import asyncio
+import threading
+import time
 import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -30,7 +32,6 @@ client = genai.Client(api_key=api_key) if api_key else None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# رابط التطبيق على Render (تأكد من ضبطه في Environment Variables على Render)
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrender.com")
 WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -44,30 +45,37 @@ ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN")
 ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOUNT_ID") else 0
 
 telegram_app: Optional[Application] = None
+is_ctrader_connected = False
+stop_ctrader_flag = False
 
 # ==================== Self-Ping Task (منع الخمول) ====================
 
 async def keep_alive():
-    """وظيفة تُبقي خادم Render مستيقظاً بإرسال طلب كل 10 دقائق"""
-    await asyncio.sleep(10)  # انتظار 10 ثوان بعد إقلاع السيرفر قبل أول طلب
+    """وظيفة تُبقي خادم Render مستيقظاً بإرسال طلب كل 8 دقائق"""
+    await asyncio.sleep(10)
     print(f"🔄 Starting Self-Ping Task targetting: {WEBHOOK_HOST}")
     
-    async with httpx.AsyncClient() as client_http:
+    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+    async with httpx.AsyncClient(limits=limits, timeout=5.0) as client_http:
         while True:
             try:
-                response = await client_http.get(WEBHOOK_HOST, timeout=10.0)
-                print(f"🟢 Self-Ping Successful | Status Code: {response.status_code}")
+                response = await client_http.get(WEBHOOK_HOST)
+                if response.status_code == 200:
+                    print(f"🟢 Self-Ping Successful | Status Code: {response.status_code}")
+                else:
+                    print(f"⚠️ Self-Ping Warning | Status Code: {response.status_code}")
             except Exception as e:
                 print(f"⚠️ Self-Ping Failed: {e}")
             
-            # الانتظار لمدة 10 دقائق (600 ثانية)
-            await asyncio.sleep(600)
+            await asyncio.sleep(480)  # كل 8 دقائق
 
-# ==================== cTrader Open API ====================
+# ==================== cTrader Open API & Auto-Reconnect ====================
 
 ctrader_client = Client(CTRADER_HOST, CTRADER_PORT, TcpProtocol)
 
 def on_connected(client):
+    global is_ctrader_connected
+    is_ctrader_connected = True
     print("✅ Connected to cTrader Open API")
     if CLIENT_ID and CLIENT_SECRET:
         request = ProtoOAApplicationAuthReq()
@@ -76,6 +84,8 @@ def on_connected(client):
         client.send(request)
 
 def on_disconnected(client, reason):
+    global is_ctrader_connected
+    is_ctrader_connected = False
     print(f"❌ Disconnected from cTrader Open API: {reason}")
 
 def on_message_received(client, message):
@@ -93,6 +103,25 @@ def on_message_received(client, message):
 ctrader_client.setConnectedCallback(on_connected)
 ctrader_client.setDisconnectedCallback(on_disconnected)
 ctrader_client.setMessageReceivedCallback(on_message_received)
+
+def ctrader_auto_reconnect_loop():
+    """مهمة خلفية في Thread مستقل تفحص الاتصال وتسعى لإعادته تلقائياً"""
+    global stop_ctrader_flag, is_ctrader_connected
+    print("🔌 cTrader Auto-Reconnect Loop started in background thread.")
+    
+    while not stop_ctrader_flag:
+        if not is_ctrader_connected and CLIENT_ID and CLIENT_SECRET:
+            print("🔄 Attempting to connect/reconnect to cTrader Open API...")
+            try:
+                ctrader_client.startService()
+            except Exception as e:
+                print(f"⚠️ cTrader Connection Error: {e}")
+        
+        # فحص حالة الاتصال كل 30 ثانية
+        for _ in range(30):
+            if stop_ctrader_flag:
+                break
+            time.sleep(1)
 
 # ==================== قاعدة البيانات ====================
 
@@ -149,7 +178,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 أهلاً بك! بوت التداول السحابي يعمل بنجاح عبر Webhook.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 الحالة: السيرفر يعمل بوضع Webhook ومهمة Self-Ping نشطة لمنع الخمول.")
+    ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل (جاري إعادة الاتصال)"
+    status_msg = (
+        f"🟢 **حالة السيرفر:** يعمل بنجاح\n"
+        f"🔌 **حالة cTrader API:** {ctrader_status}\n"
+        f"🔄 **مهمة Self-Ping:** نشطة"
+    )
+    await update.message.reply_text(status_msg, parse_mode="Markdown")
 
 async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -184,20 +219,20 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_app
+    global telegram_app, stop_ctrader_flag
     
     init_db()
 
-    # تشغيل مهمة منع الخمول تلقائياً
+    # 1. تشغيل مهمة منع الخمول
     ping_task = asyncio.create_task(keep_alive())
 
+    # 2. تشغيل cTrader Auto-Reconnect في Thread مستقل
+    stop_ctrader_flag = False
     if CLIENT_ID and CLIENT_SECRET:
-        print("🔌 Starting cTrader Open API Client...")
-        try:
-            ctrader_client.startService()
-        except Exception as e:
-            print(f"❌ Failed to start cTrader Client: {e}")
+        ctrader_thread = threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True)
+        ctrader_thread.start()
 
+    # 3. تهيئة بوت التليجرام
     if TELEGRAM_BOT_TOKEN:
         print("🤖 Initializing Telegram Bot for Webhook...")
         try:
@@ -209,9 +244,12 @@ async def lifespan(app: FastAPI):
             await telegram_app.initialize()
             await telegram_app.start()
 
-            # ضبط Webhook في سيرفرات تلغرام
             print(f"🔗 Setting Webhook to: {WEBHOOK_URL}")
-            await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+            await telegram_app.bot.set_webhook(
+                url=WEBHOOK_URL,
+                drop_pending_updates=True,
+                max_connections=40
+            )
             print("🚀 Telegram Webhook configured successfully!")
         except Exception as e:
             print(f"❌ Failed to configure Telegram Webhook: {e}")
@@ -220,10 +258,8 @@ async def lifespan(app: FastAPI):
 
     # عند إغلاق السيرفر
     print("🛑 Stopping Services...")
-    
-    # إلغاء مهمة Self-Ping
+    stop_ctrader_flag = True
     ping_task.cancel()
-    print("🛑 Self-Ping Task stopped.")
 
     if telegram_app:
         try:
@@ -269,6 +305,7 @@ def read_root():
     return {
         "status": "online",
         "mode": "webhook",
+        "ctrader_connected": is_ctrader_connected,
         "message": "Cloud Trading AI Backend connected to cTrader Open API",
         "active_model": GEMINI_MODEL
     }
