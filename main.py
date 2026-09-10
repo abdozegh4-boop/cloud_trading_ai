@@ -96,8 +96,8 @@ def on_message_received(client, message):
         print("✅ Application Authenticated successfully.")
         if ACCOUNT_ID and ACCESS_TOKEN:
             acc_auth_req = ProtoOAAccountAuthReq()
-            # تم تصحيح اسم الخاصية إلى ctraderAccountId
-            acc_auth_req.ctraderAccountId = int(ACCOUNT_ID)
+            # ✅ تم تصحيح اسم الخاصية إلى ctidTraderAccountId المعتمدة في Protobuf
+            acc_auth_req.ctidTraderAccountId = int(ACCOUNT_ID)
             acc_auth_req.accessToken = str(ACCESS_TOKEN)
             
             client.send(acc_auth_req)
