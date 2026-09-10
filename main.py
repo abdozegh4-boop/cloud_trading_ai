@@ -1,11 +1,10 @@
 import os
 import json
-import asyncio
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from google import genai
@@ -20,18 +19,21 @@ from ctrader_open_api import Client, TcpProtocol
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 
-# تحميل المتغيرات البيئية
 load_dotenv()
 
-# إعدادات الذكاء الاصطناعي وقواعد البيانات
+# المتغيرات البيئية
 GEMINI_MODEL = "gemini-2.5-flash"
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# رابط التطبيق على Render (تأكد من ضبطه في Environment Variables على Render)
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrender.com")
+WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# إعدادات cTrader Open API
+# إعدادات cTrader
 CTRADER_HOST = os.getenv("CTRADER_HOST", "demo.ctraderapi.com")
 CTRADER_PORT = int(os.getenv("CTRADER_PORT", 5035))
 CLIENT_ID = os.getenv("CTRADER_CLIENT_ID")
@@ -39,10 +41,9 @@ CLIENT_SECRET = os.getenv("CTRADER_CLIENT_SECRET")
 ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN")
 ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOUNT_ID") else 0
 
-# متغير عام للتحكم في تطبيق التلغرام
 telegram_app: Optional[Application] = None
 
-# ==================== إعداد عميل cTrader Open API ====================
+# ==================== cTrader Open API ====================
 
 ctrader_client = Client(CTRADER_HOST, CTRADER_PORT, TcpProtocol)
 
@@ -59,8 +60,6 @@ def on_disconnected(client, reason):
 
 def on_message_received(client, message):
     msg_type = message.payloadType
-
-    # استجابة توثيق التطبيق
     if msg_type == ProtoOAApplicationAuthRes().payloadType:
         print("✅ Application Authenticated successfully.")
         if ACCOUNT_ID and ACCESS_TOKEN:
@@ -68,24 +67,20 @@ def on_message_received(client, message):
             acc_auth_req.ctraderAccountId = ACCOUNT_ID
             acc_auth_req.accessToken = ACCESS_TOKEN
             client.send(acc_auth_req)
-
-    # استجابة توثيق الحساب
     elif msg_type == ProtoOAAccountAuthRes().payloadType:
-        print(f"🚀 Account {ACCOUNT_ID} Authenticated successfully! Ready for trading operations.")
+        print(f"🚀 Account {ACCOUNT_ID} Authenticated successfully!")
 
 ctrader_client.setConnectedCallback(on_connected)
 ctrader_client.setDisconnectedCallback(on_disconnected)
 ctrader_client.setMessageReceivedCallback(on_message_received)
 
-
-# ==================== إدارة قاعدة البيانات ====================
+# ==================== قاعدة البيانات ====================
 
 def get_db_connection():
     if not DATABASE_URL:
         return None
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        return conn
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     except Exception as e:
         print(f"Database connection error: {e}")
         return None
@@ -109,8 +104,7 @@ def init_db():
         except Exception as e:
             print(f"❌ Error initializing database tables: {e}")
 
-
-# ==================== نماذج البيانات (Pydantic Models) ====================
+# ==================== Pydantic Models ====================
 
 class NewsPayload(BaseModel):
     headline: str
@@ -129,14 +123,13 @@ class BulkMarketRequest(BaseModel):
     headline: Optional[str] = "Market Correlation Scan"
     market_snapshot: List[SymbolSnapshot]
 
-
 # ==================== أوامر بوت التلغرام ====================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 أهلاً بك! بوت التداول السحابي متصل بنجاح مع cTrader Open API.")
+    await update.message.reply_text("🤖 أهلاً بك! بوت التداول السحابي يعمل بنجاح عبر Webhook.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 الحالة: السيرفر يعمل والاتصال مع cTrader و DB نشط.")
+    await update.message.reply_text("🟢 الحالة: السيرفر يعمل بوضع Webhook والاتصال بنشاط.")
 
 async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -163,22 +156,18 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             cur.close()
             conn.close()
-            
-            await update.message.reply_text(f"✅ **تم تحديث الرموز المستهدفة وحفظها بنجاح:**\n`{', '.join(symbols_list)}`", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ **تم تحديث الرموز المستهدفة:**\n`{', '.join(symbols_list)}`", parse_mode="Markdown")
         except Exception as e:
-            await update.message.reply_text(f"⚠️ حدث خطأ عند الحفظ في قاعدة البيانات: {e}")
+            await update.message.reply_text(f"⚠️ حدث خطأ عند الحفظ: {e}")
 
-
-# ==================== إدارة دورة حياة التطبيق (Lifespan) ====================
+# ==================== دورة حياة التطبيق (Lifespan) ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global telegram_app
     
-    # 1. تهيئة قاعدة البيانات
     init_db()
 
-    # 2. تشغيل اتصال cTrader Open API
     if CLIENT_ID and CLIENT_SECRET:
         print("🔌 Starting cTrader Open API Client...")
         try:
@@ -186,9 +175,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"❌ Failed to start cTrader Client: {e}")
 
-    # 3. تهيئة وبدء بوت التلغرام
     if TELEGRAM_BOT_TOKEN:
-        print("🤖 Initializing Telegram Bot...")
+        print("🤖 Initializing Telegram Bot for Webhook...")
         try:
             telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
             telegram_app.add_handler(CommandHandler("start", cmd_start))
@@ -196,22 +184,24 @@ async def lifespan(app: FastAPI):
             telegram_app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
 
             await telegram_app.initialize()
-            await telegram_app.updater.start_polling(drop_pending_updates=True)
             await telegram_app.start()
-            print("🚀 Telegram Bot is polling...")
+
+            # ضبط Webhook في سيرفرات تلغرام
+            print(f"🔗 Setting Webhook to: {WEBHOOK_URL}")
+            await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+            print("🚀 Telegram Webhook configured successfully!")
         except Exception as e:
-            print(f"❌ Failed to start Telegram Bot: {e}")
+            print(f"❌ Failed to configure Telegram Webhook: {e}")
 
     yield
 
-    # 4. إيقاف وإغلاق الخدمات بنظافة عند إغلاق السيرفر
+    # عند إغلاق السيرفر
     print("🛑 Stopping Services...")
     if telegram_app:
         try:
-            if telegram_app.updater and telegram_app.updater.running:
-                await telegram_app.updater.stop()
-            if telegram_app.running:
-                await telegram_app.stop()
+            print("🔗 Removing Telegram Webhook...")
+            await telegram_app.bot.delete_webhook()
+            await telegram_app.stop()
             await telegram_app.shutdown()
             print("🛑 Telegram Bot stopped cleanly.")
         except Exception as e:
@@ -224,9 +214,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Error stopping cTrader Client: {e}")
 
-
 app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
 
+# ==================== Webhook Endpoint ====================
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """استقبال التحديثات القادمة من تلغرام وتمريرها إلى البوت"""
+    if not telegram_app:
+        raise HTTPException(status_code=500, detail="Telegram application not initialized")
+
+    try:
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.process_update(update)
+        return Response(status_code=status.HTTP_200_OK)
+    except Exception as e:
+        print(f"⚠️ Error processing Webhook update: {e}")
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # ==================== FastAPI Endpoints ====================
 
@@ -235,6 +240,7 @@ app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
 def read_root():
     return {
         "status": "online",
+        "mode": "webhook",
         "message": "Cloud Trading AI Backend connected to cTrader Open API",
         "active_model": GEMINI_MODEL
     }
