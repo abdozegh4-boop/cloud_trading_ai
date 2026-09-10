@@ -13,7 +13,7 @@ from google.genai import types
 
 # مكتبات التلغرام
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # مكتبات cTrader Open API
 from ctrader_open_api import Client, TcpProtocol
@@ -38,6 +38,9 @@ CLIENT_ID = os.getenv("CTRADER_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CTRADER_CLIENT_SECRET")
 ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN")
 ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOUNT_ID") else 0
+
+# متغير عام للتحكم في تطبيق التلغرام
+telegram_app: Optional[Application] = None
 
 # ==================== إعداد عميل cTrader Open API ====================
 
@@ -170,6 +173,8 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global telegram_app
+    
     # 1. تهيئة قاعدة البيانات
     init_db()
 
@@ -181,7 +186,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"❌ Failed to start cTrader Client: {e}")
 
-    # 3. تشغيل بوت التلغرام
+    # 3. تهيئة وبدء بوت التلغرام
     if TELEGRAM_BOT_TOKEN:
         print("🤖 Initializing Telegram Bot...")
         try:
@@ -191,20 +196,33 @@ async def lifespan(app: FastAPI):
             telegram_app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
 
             await telegram_app.initialize()
+            await telegram_app.updater.start_polling(drop_pending_updates=True)
             await telegram_app.start()
-            
-            # إسقاط التحديثات المعلقة لتجنب تعارض Conflict
-            asyncio.create_task(telegram_app.updater.start_polling(drop_pending_updates=True))
             print("🚀 Telegram Bot is polling...")
         except Exception as e:
             print(f"❌ Failed to start Telegram Bot: {e}")
 
     yield
 
-    # إيقاف الخدمات عند إغلاق السيرفر
+    # 4. إيقاف وإغلاق الخدمات بنظافة عند إغلاق السيرفر
     print("🛑 Stopping Services...")
+    if telegram_app:
+        try:
+            if telegram_app.updater and telegram_app.updater.running:
+                await telegram_app.updater.stop()
+            if telegram_app.running:
+                await telegram_app.stop()
+            await telegram_app.shutdown()
+            print("🛑 Telegram Bot stopped cleanly.")
+        except Exception as e:
+            print(f"⚠️ Error shutting down Telegram Bot: {e}")
+
     if CLIENT_ID and CLIENT_SECRET:
-        ctrader_client.stopService()
+        try:
+            ctrader_client.stopService()
+            print("🛑 cTrader Client stopped.")
+        except Exception as e:
+            print(f"⚠️ Error stopping cTrader Client: {e}")
 
 
 app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
