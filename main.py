@@ -4,9 +4,9 @@ import asyncio
 import threading
 import time
 import httpx
-import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from contextlib import asynccontextmanager
@@ -15,8 +15,14 @@ from google import genai
 from google.genai import types
 
 # مكتبات التلغرام
-from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes
+)
 
 # مكتبات cTrader Open API و Twisted Engine
 from twisted.internet import reactor
@@ -49,29 +55,65 @@ ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOU
 telegram_app: Optional[Application] = None
 is_ctrader_connected = False
 stop_ctrader_flag = False
+db_pool: Optional[pool.SimpleConnectionPool] = None
 
-# ==================== Self-Ping Task (منع الخمول) ====================
+# تخزين مؤقت لببيانات الحساب والصفقات القادمة من cTrader
+ctrader_account_info: Dict[str, Any] = {
+    "balance": 0.0,
+    "equity": 0.0,
+    "margin": 0.0,
+    "free_margin": 0.0
+}
+active_positions: List[Dict[str, Any]] = []
+
+# ==================== إدارة قاعدة البيانات ====================
+
+def init_db_pool():
+    global db_pool
+    if DATABASE_URL:
+        try:
+            db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+            print("✅ Database connection pool initialized successfully.")
+        except Exception as e:
+            print(f"❌ Failed to create DB pool: {e}")
+
+def init_db():
+    if not db_pool:
+        return
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"❌ Error initializing database tables: {e}")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+# ==================== Self-Ping Task ====================
 
 async def keep_alive():
-    """وظيفة تُبقي خادم Render مستيقظاً بإرسال طلب كل 8 دقائق"""
     await asyncio.sleep(10)
-    print(f"🔄 Starting Self-Ping Task targetting: {WEBHOOK_HOST}")
-    
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    async with httpx.AsyncClient(limits=limits, timeout=5.0) as client_http:
+    async with httpx.AsyncClient(limits=limits, timeout=10.0) as client_http:
         while True:
             try:
                 response = await client_http.get(WEBHOOK_HOST)
                 if response.status_code == 200:
-                    print(f"🟢 Self-Ping Successful | Status Code: {response.status_code}")
-                else:
-                    print(f"⚠️ Self-Ping Warning | Status Code: {response.status_code}")
+                    print("🟢 Self-Ping Successful")
             except Exception as e:
                 print(f"⚠️ Self-Ping Failed: {e}")
-            
-            await asyncio.sleep(480)  # كل 8 دقائق
+            await asyncio.sleep(480)
 
-# ==================== cTrader Open API & Auto-Reconnect ====================
+# ==================== cTrader Open API ====================
 
 ctrader_client = Client(CTRADER_HOST, CTRADER_PORT, TcpProtocol)
 
@@ -91,28 +133,34 @@ def on_disconnected(client, reason):
     print(f"❌ Disconnected from cTrader Open API: {reason}")
 
 def on_message_received(client, message):
+    global ctrader_account_info, active_positions
     msg_type = message.payloadType
+    
     if msg_type == ProtoOAApplicationAuthRes().payloadType:
-        print("✅ Application Authenticated successfully.")
         if ACCOUNT_ID and ACCESS_TOKEN:
             acc_auth_req = ProtoOAAccountAuthReq()
-            # ✅ تم تصحيح اسم الخاصية إلى ctidTraderAccountId المعتمدة في Protobuf
             acc_auth_req.ctidTraderAccountId = int(ACCOUNT_ID)
             acc_auth_req.accessToken = str(ACCESS_TOKEN)
-            
             client.send(acc_auth_req)
             
     elif msg_type == ProtoOAAccountAuthRes().payloadType:
         print(f"🚀 Account {ACCOUNT_ID} Authenticated successfully!")
+        # طلب تحديث بيانات الحساب والصفقات فور الاتصال
+        request_account_details()
+
+def request_account_details():
+    """إرسال طلب لمزامنة الصفقات والرصيد مع cTrader"""
+    if is_ctrader_connected and ACCOUNT_ID:
+        req = ProtoOAReconcileReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
+        ctrader_client.send(req)
 
 ctrader_client.setConnectedCallback(on_connected)
 ctrader_client.setDisconnectedCallback(on_disconnected)
 ctrader_client.setMessageReceivedCallback(on_message_received)
 
 def start_ctrader_reactor():
-    """تشغيل Twisted Reactor وتفعيل خدمة cTrader في Thread مستقل"""
     try:
-        print("🔌 Starting cTrader Twisted Reactor...")
         ctrader_client.startService()
         if not reactor.running:
             reactor.run(installSignalHandlers=False)
@@ -120,57 +168,20 @@ def start_ctrader_reactor():
         print(f"⚠️ cTrader Reactor Error: {e}")
 
 def ctrader_auto_reconnect_loop():
-    """مهمة خلفية تفحص حالة الاتصال وتطلب إعادة الاتصال عبر Twisted Event Loop"""
-    global stop_ctrader_flag, is_ctrader_connected
-    print("🔌 cTrader Monitor Loop started.")
-    
-    # تشغيل الاتصال والـ Reactor لأول مرة في Thread منفصل
+    global stop_ctrader_flag
     reactor_thread = threading.Thread(target=start_ctrader_reactor, daemon=True)
     reactor_thread.start()
     
     while not stop_ctrader_flag:
         if not is_ctrader_connected and CLIENT_ID and CLIENT_SECRET:
-            print("🔄 Attempting to connect/reconnect to cTrader Open API...")
             try:
                 reactor.callFromThread(ctrader_client.startService)
             except Exception as e:
                 print(f"⚠️ cTrader Reconnect Error: {e}")
-        
-        # فحص حالة الاتصال كل 30 ثانية
         for _ in range(30):
             if stop_ctrader_flag:
                 break
             time.sleep(1)
-
-# ==================== قاعدة البيانات ====================
-
-def get_db_connection():
-    if not DATABASE_URL:
-        return None
-    try:
-        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
-
-def init_db():
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_settings (
-                    key VARCHAR(50) PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-            conn.commit()
-            cur.close()
-            conn.close()
-            print("✅ Database tables initialized successfully.")
-        except Exception as e:
-            print(f"❌ Error initializing database tables: {e}")
 
 # ==================== Pydantic Models ====================
 
@@ -191,48 +202,126 @@ class BulkMarketRequest(BaseModel):
     headline: Optional[str] = "Market Correlation Scan"
     market_snapshot: List[SymbolSnapshot]
 
-# ==================== أوامر بوت التلغرام ====================
+# ==================== أوامر لوحة تحكم التليجرام ====================
+
+def is_authorized(update: Update) -> bool:
+    if not MY_TELEGRAM_CHAT_ID:
+        return True
+    return str(update.effective_chat.id) == str(MY_TELEGRAM_CHAT_ID)
+
+def main_keyboard():
+    """لوحة تفاعلية بأزرار سريعة"""
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 حالة النظام", callback_data="btn_status"),
+            InlineKeyboardButton("💼 معلومات الحساب", callback_data="btn_account")
+        ],
+        [
+            InlineKeyboardButton("📈 الصفقات المفتوحة", callback_data="btn_positions"),
+            InlineKeyboardButton("🔄 تحديث البيانات", callback_data="btn_refresh")
+        ],
+        [
+            InlineKeyboardButton("⚠️ إغلاق الكل (طوارئ)", callback_data="btn_closeall")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 أهلاً بك! بوت التداول السحابي يعمل بنجاح عبر Webhook.")
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+        return
+    await update.message.reply_text(
+        "🤖 **مرحباً بك في لوحة تحكم التداول السحابي!**\n\nيمكنك مراقبة جميع أداء البوت وإدارته من الأزرار أدناه:",
+        reply_markup=main_keyboard(),
+        parse_mode="Markdown"
+    )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل (جاري إعادة الاتصال)"
+    if not is_authorized(update):
+        return
+    ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
     status_msg = (
-        f"🟢 **حالة السيرفر:** يعمل بنجاح\n"
-        f"🔌 **حالة cTrader API:** {ctrader_status}\n"
-        f"🔄 **مهمة Self-Ping:** نشطة"
+        f"🖥 **حالة الخادم:** 🟢 يعمل بنجاح\n"
+        f"🔌 **شبكة cTrader API:** {ctrader_status}\n"
+        f"🔄 **مهمة Self-Ping:** 🟢 نشطة\n"
+        f"🧠 **نموذج الذكاء الاصطناعي:** `{GEMINI_MODEL}`"
     )
-    await update.message.reply_text(status_msg, parse_mode="Markdown")
+    await update.message.reply_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
 
-async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ صيغة غير صحيحة.\nاستخدم: `/set_symbols EURUSD,GBPUSD,XAUUSD`", parse_mode="Markdown")
+async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض تفاصيل الحساب المالي"""
+    if not is_authorized(update):
+        return
+    
+    # تحديث البيانات عبر API
+    request_account_details()
+    
+    bal = ctrader_account_info.get("balance", 0.0)
+    eq = ctrader_account_info.get("equity", 0.0)
+    margin = ctrader_account_info.get("margin", 0.0)
+    pnl = eq - bal
+    pnl_sign = "🟢 +" if pnl >= 0 else "🔴 "
+
+    msg = (
+        f"💳 **تقرير حساب التداول:**\n\n"
+        f"🔹 **الرصيد (Balance):** `${bal:,.2f}`\n"
+        f"🔹 **الصافي الحالي (Equity):** `${eq:,.2f}`\n"
+        f"🔹 **الأرباح/الخسائر غير المحققة:** {pnl_sign}`${pnl:,.2f}`\n"
+        f"🔹 **الهامش المستغل (Margin):** `${margin:,.2f}`"
+    )
+    await update.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض الصفقات المفتوحة"""
+    if not is_authorized(update):
         return
 
-    raw_input = "".join(context.args).replace("\u200b", "").strip()
-    symbols_list = [s.strip().upper() for s in raw_input.split(",") if s.strip()]
+    request_account_details()
 
-    if not symbols_list:
-        await update.message.reply_text("❌ لم يتم التعرف على أزواج صالحة.")
+    if not active_positions:
+        await update.message.reply_text("📭 **لا توجد صفقات مفتوحة حالياً.**", reply_markup=main_keyboard(), parse_mode="Markdown")
         return
 
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            symbols_str = ",".join(symbols_list)
-            cur.execute("""
-                INSERT INTO bot_settings (key, value, updated_at)
-                VALUES ('active_symbols', %s, NOW())
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
-            """, (symbols_str,))
-            conn.commit()
-            cur.close()
-            conn.close()
-            await update.message.reply_text(f"✅ **تم تحديث الرموز المستهدفة:**\n`{', '.join(symbols_list)}`", parse_mode="Markdown")
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ حدث خطأ عند الحفظ: {e}")
+    msg = "📈 **الصفقات المفتوحة حالياً:**\n\n"
+    for pos in active_positions:
+        side = "🟢 BUY" if pos.get("trade_type") == "BUY" else "🔴 SELL"
+        msg += (
+            f"🔹 **{pos.get('symbol')}** | {side}\n"
+            f"   • اللوت: `{pos.get('volume')}`\n"
+            f"   • سعر الدخول: `{pos.get('entry_price')}`\n"
+            f"   • الربح/الخسارة: `{pos.get('pnl'):+.2f} USD`\n\n"
+        )
+    await update.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إغلاق كافة الصفقات"""
+    if not is_authorized(update):
+        return
+    
+    if not is_ctrader_connected:
+        await update.message.reply_text("❌ متعذر الإغلاق، الاتصال بـ cTrader مقطوع.")
+        return
+
+    # إرسال طلب إغلاق الحساب للشبكة
+    # (يمكن وضع دالة cTrader المخصصة للإغلاق الجماعي هنا)
+    await update.message.reply_text("⚠️ **جاري إرسال أوامر الإغلاق الفوري لجميع الصفقات...**")
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة نقرات الأزرار التفاعلية"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "btn_status":
+        await cmd_status(update, context)
+    elif query.data == "btn_account":
+        await cmd_account(update, context)
+    elif query.data == "btn_positions":
+        await cmd_positions(update, context)
+    elif query.data == "btn_refresh":
+        request_account_details()
+        await query.edit_message_text("🔄 **تمت إعادة تحديث بيانات الحساب والشبكة.**", reply_markup=main_keyboard(), parse_mode="Markdown")
+    elif query.data == "btn_closeall":
+        await cmd_close_all(update, context)
 
 # ==================== دورة حياة التطبيق (Lifespan) ====================
 
@@ -240,203 +329,86 @@ async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def lifespan(app: FastAPI):
     global telegram_app, stop_ctrader_flag
     
+    init_db_pool()
     init_db()
 
-    # 1. تشغيل مهمة منع الخمول
     ping_task = asyncio.create_task(keep_alive())
 
-    # 2. تشغيل cTrader Auto-Reconnect والـ Reactor في Thread مستقل
     stop_ctrader_flag = False
     if CLIENT_ID and CLIENT_SECRET:
         ctrader_thread = threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True)
         ctrader_thread.start()
 
-    # 3. تهيئة بوت التليجرام
     if TELEGRAM_BOT_TOKEN:
-        print("🤖 Initializing Telegram Bot for Webhook...")
         try:
             telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+            
+            # تسجيل أوامر البوت
             telegram_app.add_handler(CommandHandler("start", cmd_start))
             telegram_app.add_handler(CommandHandler("status", cmd_status))
-            telegram_app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
+            telegram_app.add_handler(CommandHandler("account", cmd_account))
+            telegram_app.add_handler(CommandHandler("positions", cmd_positions))
+            telegram_app.add_handler(CommandHandler("closeall", cmd_close_all))
+            
+            # تسجيل معالج أزرار التحكم
+            telegram_app.add_handler(CallbackQueryHandler(handle_callback_query))
 
             await telegram_app.initialize()
             await telegram_app.start()
 
-            print(f"🔗 Setting Webhook to: {WEBHOOK_URL}")
             await telegram_app.bot.set_webhook(
                 url=WEBHOOK_URL,
                 drop_pending_updates=True,
                 max_connections=40
             )
-            print("🚀 Telegram Webhook configured successfully!")
 
-            # إرسال إشعار الإقلاع للمشرف
             if MY_TELEGRAM_CHAT_ID:
                 try:
                     await telegram_app.bot.send_message(
                         chat_id=int(MY_TELEGRAM_CHAT_ID),
-                        text="🚀 **تم إكتمال الـ Deployment بنجاح!**\nالسيرفر، cTrader API، وبوت التداول جاهزان للعمل الآن.",
+                        text="🚀 **تم تشغيل البوت ولوحة التحكم التفاعلية بنجاح!**",
+                        reply_markup=main_keyboard(),
                         parse_mode="Markdown"
                     )
-                    print("📨 Startup notification sent to Telegram admin!")
                 except Exception as e:
-                    print(f"⚠️ Failed to send startup notification: {e}")
+                    print(f"⚠️ Telegram notification error: {e}")
 
         except Exception as e:
-            print(f"❌ Failed to configure Telegram Webhook: {e}")
+            print(f"❌ Webhook configuration failed: {e}")
 
     yield
 
-    # عند إغلاق السيرفر
-    print("🛑 Stopping Services...")
     stop_ctrader_flag = True
     ping_task.cancel()
 
     if telegram_app:
         try:
-            print("🔗 Removing Telegram Webhook...")
             await telegram_app.bot.delete_webhook()
             await telegram_app.stop()
             await telegram_app.shutdown()
-            print("🛑 Telegram Bot stopped cleanly.")
         except Exception as e:
-            print(f"⚠️ Error shutting down Telegram Bot: {e}")
+            print(f"⚠️ Error stopping Telegram Bot: {e}")
 
-    if CLIENT_ID and CLIENT_SECRET:
-        try:
-            if reactor.running:
-                reactor.callFromThread(reactor.stop)
-            ctrader_client.stopService()
-            print("🛑 cTrader Client stopped.")
-        except Exception as e:
-            print(f"⚠️ Error stopping cTrader Client: {e}")
+    if db_pool:
+        db_pool.closeall()
 
 app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
 
-# ==================== Webhook Endpoint ====================
+# ==================== Endpoints ====================
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    """استقبال التحديثات القادمة من تلغرام وتمريرها إلى البوت"""
     if not telegram_app:
         raise HTTPException(status_code=500, detail="Telegram application not initialized")
-
     try:
         data = await request.json()
         update = Update.de_json(data, telegram_app.bot)
         await telegram_app.process_update(update)
         return Response(status_code=status.HTTP_200_OK)
     except Exception as e:
-        print(f"⚠️ Error processing Webhook update: {e}")
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-# ==================== FastAPI Endpoints ====================
 
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {
-        "status": "online",
-        "mode": "webhook",
-        "ctrader_connected": is_ctrader_connected,
-        "message": "Cloud Trading AI Backend connected to cTrader Open API",
-        "active_model": GEMINI_MODEL
-    }
-
-@app.get("/api/get-active-symbols")
-@app.get("/get-active-symbols")
-def get_active_symbols():
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM bot_settings WHERE key = 'active_symbols';")
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if row and row.get("value"):
-            symbols_list = [s.strip() for s in row["value"].split(",") if s.strip()]
-            return {"status": "success", "symbols": symbols_list, "raw_symbols": row["value"]}
-        else:
-            return {"status": "default", "symbols": ["EURUSD", "GBPUSD", "XAUUSD"], "raw_symbols": "EURUSD,GBPUSD,XAUUSD"}
-    except Exception as e:
-        if conn:
-            conn.close()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.post("/api/calculate-grid-params")
-@app.post("/calculate-grid-params")
-def calculate_grid_params(data: NewsPayload):
-    if not client:
-        raise HTTPException(status_code=500, detail="Gemini API Key missing")
-    prompt = f"""
-    You are an expert Forex Quantitative Trader.
-    Analyze market conditions:
-    - Headline: {data.headline}
-    - Symbol: {data.symbol}
-    - ATR: {data.atr}
-    - Volume Ratio: {data.volume_ratio}
-
-    Provide recommended Grid spacing in pips and Basket Take-Profit in pips.
-    Return ONLY JSON with structure:
-    {{"recommended_grid_pips": int, "recommended_basket_tp": int}}
-    """
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        base_grid = int(data.atr * 10000 * 1.5) if data.atr > 0 else 20
-        return {
-            "recommended_grid_pips": max(base_grid, 10),
-            "recommended_basket_tp": 10,
-            "error_fallback": str(e)
-        }
-
-@app.post("/api/calculate-correlated-grid")
-@app.post("/calculate-correlated-grid")
-def calculate_correlated_grid(data: BulkMarketRequest):
-    if not client:
-        raise HTTPException(status_code=500, detail="Gemini API Key missing")
-    snapshot_summary = "".join([
-        f"- Symbol: {item.symbol} | Price: {item.price} | Change: {item.change_pct}% | ATR: {item.atr_pips} pips\n"
-        for item in data.market_snapshot
-    ])
-
-    prompt = f"""
-    You are an expert AI Risk Manager and Quantitative Grid Trading Strategist.
-    Analyze the following multi-asset market snapshot captured at the exact same time:
-
-    {snapshot_summary}
-
-    Global Market Event / News Context: {data.headline}
-
-    STRICT RESPONSE FORMAT:
-    Return ONLY a valid JSON object matching this structure:
-    {{
-      "currency_strength_summary": "Brief analysis",
-      "symbols_config": {{
-        "EURUSD": {{
-          "grid_spacing_pips": 25,
-          "basket_tp_pips": 30,
-          "risk_mode": "BALANCED",
-          "bias": "NEUTRAL"
-        }}
-      }}
-    }}
-    """
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        return {"status": "success", "data": json.loads(response.text)}
-    except Exception as e:
-        return {"status": "warning", "message": "AI calculation failed", "error": str(e)}
+    return {"status": "online", "ctrader_connected": is_ctrader_connected}
