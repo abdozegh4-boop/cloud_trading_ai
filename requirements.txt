@@ -1,11 +1,6 @@
 ﻿fastapi
 uvicorn
-pydantic
-psycopg2-binary
-python-dotenv
+python-telegram-bot
 google-genai
-python-telegram-bot>=20.8
-httpx>=0.27.0
-feedparser>=6.0.11
-websockets
-google-generativeai>=0.8.0
+httpx
+feedparser

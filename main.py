@@ -1,16 +1,28 @@
 import os
 import asyncio
 import logging
+import threading
 import httpx
 import feedparser
 from typing import List, Dict, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-import google.generativeai as genai
 
-# ================= ================= =================
+from fastapi import FastAPI
+import uvicorn
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes
+)
+
+# استخدام SDK الجديدة الرسمية من Google
+from google import genai
+
+# =====================================================================
 # 1. الإعدادات العامة والتهيئات (Configurations)
-# ================= ================= =================
+# =====================================================================
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -21,9 +33,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "YOUR_FINNHUB_API_KEY")
 
-# إعداد Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+# إعداد خادم Gemini SDK الحديث
+if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY":
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    gemini_client = genai.Client()
 
 # محاكاة قاعدة بيانات لإعدادات المستخدمين (DB State Storage)
 USER_SETTINGS = {
@@ -31,9 +45,26 @@ USER_SETTINGS = {
     "symbols_forex": ["EURUSD", "GBPUSD"]
 }
 
-# ================= ================= =================
-# 2. محرك الأخبار والتقويم الاقتصادي (News Engine)
-# ================= ================= =================
+# =====================================================================
+# 2. خادم HTTP خفيف لتفادي توقف الخدمة على Render (Port Scanner)
+# =====================================================================
+
+app = FastAPI()
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "Bot & Analysis Engine is running fine!"}
+
+def run_web_server():
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+# تشغيل خادم الويب في Thread منفصل قبل بدء البوت
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# =====================================================================
+# 3. محرك الأخبار والتقويم الاقتصادي (News Engine)
+# =====================================================================
 
 async def get_forex_factory_calendar() -> str:
     """جلب التقويم الاقتصادي والأحداث عالية التأثير من Forex Factory"""
@@ -83,9 +114,9 @@ def get_tradingview_rss() -> str:
         logging.error(f"⚠️ TradingView RSS Error: {e}")
     return "تعذر جلب تغذية TradingView RSS."
 
-# ================= ================= =================
-# 3. محاكاة جلب البيانات الفنية (cTrader Data Fetcher)
-# ================= ================= =================
+# =====================================================================
+# 4. جلب البيانات الفنية (cTrader Data Fetcher)
+# =====================================================================
 
 async def fetch_ctrader_data_for_timeframes(symbol: str, timeframes: List[str]) -> Dict[str, Any]:
     """جلب بيانات السوق لكل فريم زمني محدد من cTrader"""
@@ -99,15 +130,15 @@ async def fetch_ctrader_data_for_timeframes(symbol: str, timeframes: List[str]) 
         }
     return market_data
 
-# ================= ================= =================
-# 4. تجميع السياق وتوليد التقرير عبر Gemini
-# ================= ================= =================
+# =====================================================================
+# 5. تجميع السياق وتوليد التقرير عبر Gemini (Google GenAI SDK)
+# =====================================================================
 
 async def generate_analysis_report(symbol: str) -> str:
     """تجميع الأخبار والبيانات الفنية وتوليد التحليل عبر Gemini"""
     selected_tfs = USER_SETTINGS.get("selected_timeframes", ["H1", "H4"])
     
-    # 1. جلب المصادر الإخبارية الثلاثة بالتوازي
+    # 1. جلب المصادر الإخبارية بالتوازي
     calendar_data, finnhub_data = await asyncio.gather(
         get_forex_factory_calendar(),
         get_finnhub_news()
@@ -140,15 +171,19 @@ async def generate_analysis_report(symbol: str) -> str:
     """
     
     try:
-        response = model.generate_content(prompt)
+        # استخدام موديل gemini-2.5-flash بطلب الحديث
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
         return response.text
     except Exception as e:
         logging.error(f"خطأ أثناء استدعاء Gemini API: {e}")
         return "حدث خطأ أثناء إعداد التحليل بواسطة الذكاء الاصطناعي."
 
-# ================= ================= =================
-# 5. واجهة تلغرام وإدارة الفريمات (Telegram Bot)
-# ================= ================= =================
+# =====================================================================
+# 6. واجهة تلغرام وإدارة الفريمات (Telegram Bot)
+# =====================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -201,19 +236,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "analyze_EURUSD":
         await query.edit_message_text("⏳ جاري جلب التقويم الاقتصادي والأخبار وبيانات cTrader وتوليد التحليل...")
         report = await generate_analysis_report("EURUSD")
-        await query.message.reply_text(report, parse_mode="Markdown")
+        
+        # إرسال التقرير بنص عادي متجنباً خطأ المارك داون من تلغرام
+        try:
+            await query.message.reply_text(report, parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text(report)
 
-# ================= ================= =================
-# 6. التشغيل الرئيسي (Main)
-# ================= ================= =================
+# =====================================================================
+# 7. التشغيل الرئيسي (Main)
+# =====================================================================
 
 def main():
+    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        raise ValueError("يرجى إدخال TELEGRAM_BOT_TOKEN الصحيح في متغيرات البيئة!")
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    logging.info("تم تشغيل البوت بنجاح...")
+    logging.info("تم تشغيل خادم الويب واستطلاع تلغرام بنجاح...")
     app.run_polling()
 
 if __name__ == "__main__":
