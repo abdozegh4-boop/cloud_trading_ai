@@ -33,7 +33,8 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 load_dotenv()
 
 # ==================== المتغيرات البيئية ====================
-GEMINI_MODEL = "gemini-2.5-flash"
+# تحديث النموذج إلى النسخة المدعومة والمستقرة 3.6 Flash
+GEMINI_MODEL = "gemini-3.6-flash"
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
@@ -210,17 +211,18 @@ def is_authorized(update: Update) -> bool:
     return str(user_id) == str(MY_TELEGRAM_CHAT_ID)
 
 def main_keyboard():
-    """لوحة تفاعلية بأزرار سريعة"""
+    """لوحة تفاعلية بأزرار سريعة تشتمل على فحص الذكاء الاصطناعي"""
     keyboard = [
         [
             InlineKeyboardButton("📊 حالة النظام", callback_data="btn_status"),
-            InlineKeyboardButton("💳 معلومات الحساب", callback_data="btn_account")
+            InlineKeyboardButton("🤖 اختبر AI", callback_data="btn_testai")
         ],
         [
-            InlineKeyboardButton("📈 الصفقات المفتوحة", callback_data="btn_positions"),
-            InlineKeyboardButton("🔄 تحديث البيانات", callback_data="btn_refresh")
+            InlineKeyboardButton("💳 معلومات الحساب", callback_data="btn_account"),
+            InlineKeyboardButton("📈 الصفقات المفتوحة", callback_data="btn_positions")
         ],
         [
+            InlineKeyboardButton("🔄 تحديث البيانات", callback_data="btn_refresh"),
             InlineKeyboardButton("⚠️ إغلاق الكل (طوارئ)", callback_data="btn_closeall")
         ]
     ]
@@ -247,6 +249,35 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧠 **نموذج الذكاء الاصطناعي:** `{GEMINI_MODEL}`"
     )
     await update.message.reply_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+async def cmd_test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر لاختبار استجابة الذكاء الاصطناعي عبر التلغرام فورا"""
+    if not is_authorized(update):
+        return
+    
+    if not client:
+        await update.message.reply_text("❌ **مفتاح API الخاص بـ Gemini غير معرف!**", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("⏳ **جاري اختبار الاتصال بنموذج الذكاء الاصطناعي...**")
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents="رد باختصار شديد: هل تعمل بشكل صحيح؟ وما هو التاريخ أو الوقت الآن؟"
+        )
+        await update.message.reply_text(
+            f"✅ **الذكاء الاصطناعي يعمل بنجاح!**\n\n"
+            f"🔹 **النموذج:** `{GEMINI_MODEL}`\n"
+            f"🔹 **استجابة Gemini:** {response.text}",
+            reply_markup=main_keyboard(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **فشل الاتصال بالذكاء الاصطناعي:**\n`{str(e)}`",
+            reply_markup=main_keyboard(),
+            parse_mode="Markdown"
+        )
 
 async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -298,7 +329,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ **جاري إرسال أوامر الإغلاق الفوري لجميع الصفقات...**")
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إدارة أزرار التلغرام وحل مشكلة عدم استجابة النقرات"""
+    """إدارة أزرار التلغرام التفاعلية"""
     query = update.callback_query
     await query.answer()
 
@@ -315,6 +346,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"🧠 **نموذج الذكاء الاصطناعي:** `{GEMINI_MODEL}`"
         )
         await query.message.reply_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+    elif query.data == "btn_testai":
+        if not client:
+            await query.message.reply_text("❌ **مفتاح API الخاص بـ Gemini غير معرف!**", parse_mode="Markdown")
+            return
+        
+        await query.message.reply_text("⏳ **جاري فحص استجابة الذكاء الاصطناعي...**")
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents="رد بكلمة واحدة فقط تؤكد أنك تعمل بنجاح."
+            )
+            await query.message.reply_text(
+                f"✅ **الذكاء الاصطناعي يعمل بشكل ممتاز!**\n\n"
+                f"🔹 **النموذج:** `{GEMINI_MODEL}`\n"
+                f"🔹 **رد النموذج:** {response.text}",
+                reply_markup=main_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await query.message.reply_text(f"❌ **خطأ في الذكاء الاصطناعي:**\n`{str(e)}`", parse_mode="Markdown")
 
     elif query.data == "btn_account":
         request_account_details()
@@ -379,6 +431,7 @@ async def lifespan(app: FastAPI):
             # تسجيل أوامر البوت
             telegram_app.add_handler(CommandHandler("start", cmd_start))
             telegram_app.add_handler(CommandHandler("status", cmd_status))
+            telegram_app.add_handler(CommandHandler("testai", cmd_test_ai))
             telegram_app.add_handler(CommandHandler("account", cmd_account))
             telegram_app.add_handler(CommandHandler("positions", cmd_positions))
             telegram_app.add_handler(CommandHandler("closeall", cmd_close_all))
@@ -399,7 +452,7 @@ async def lifespan(app: FastAPI):
                 try:
                     await telegram_app.bot.send_message(
                         chat_id=int(MY_TELEGRAM_CHAT_ID),
-                        text="🚀 **تم تشغيل البوت ولوحة التحكم التفاعلية بنجاح!**",
+                        text=f"🚀 **تم تشغيل البوت ولوحة التحكم بنجاح!**\n🤖 النموذج الاعتمادي: `{GEMINI_MODEL}`",
                         reply_markup=main_keyboard(),
                         parse_mode="Markdown"
                     )
