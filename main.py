@@ -49,15 +49,15 @@ USER_SETTINGS = {
 # 2. خادم HTTP خفيف لتفادي توقف الخدمة على Render (Port Scanner)
 # =====================================================================
 
-app = FastAPI()
+web_app = FastAPI()
 
-@app.get("/")
+@web_app.get("/")
 def health_check():
     return {"status": "ok", "message": "Bot & Analysis Engine is running fine!"}
 
 def run_web_server():
     port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
 
 # تشغيل خادم الويب في Thread منفصل قبل بدء البوت
 threading.Thread(target=run_web_server, daemon=True).start()
@@ -134,6 +134,14 @@ async def fetch_ctrader_data_for_timeframes(symbol: str, timeframes: List[str]) 
 # 5. تجميع السياق وتوليد التقرير عبر Gemini (Google GenAI SDK)
 # =====================================================================
 
+def _call_gemini_api(prompt: str) -> str:
+    """دالة مزامنة لتشغيل Gemini بشكل منفصل لتجنب بلوك الـ Event Loop"""
+    response = gemini_client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt,
+    )
+    return response.text
+
 async def generate_analysis_report(symbol: str) -> str:
     """تجميع الأخبار والبيانات الفنية وتوليد التحليل عبر Gemini"""
     selected_tfs = USER_SETTINGS.get("selected_timeframes", ["H1", "H4"])
@@ -171,12 +179,9 @@ async def generate_analysis_report(symbol: str) -> str:
     """
     
     try:
-        # استخدام موديل gemini-2.5-flash بطلب الحديث
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        return response.text
+        # تشغيل دالة Gemini المزامنة بداخل thread لمنع تجميد البوت
+        report = await asyncio.to_thread(_call_gemini_api, prompt)
+        return report
     except Exception as e:
         logging.error(f"خطأ أثناء استدعاء Gemini API: {e}")
         return "حدث خطأ أثناء إعداد التحليل بواسطة الذكاء الاصطناعي."
@@ -193,9 +198,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("أهلاً بك في نظام التحليل الفني والمالي المتكامل. اختر من القائمة:", reply_markup=reply_markup)
 
+async def send_long_message(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال النصوص الطويلة عبر تقسيمها إلى أجزاء تناسب حد تلغرام (4000 حرف)"""
+    max_length = 4000
+    for i in range(0, len(text), max_length):
+        chunk = text[i:i + max_length]
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(chat_id=chat_id, text=chunk)
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    
+    # الإجابة الفورية لمنع خطأ Query is too old
+    try:
+        await query.answer()
+    except Exception as e:
+        logging.warning(f"تجاوز الإجابة على Callback Query: {e}")
 
     if query.data == "manage_timeframes":
         all_tfs = ["M15", "M30", "H1", "H4", "D1"]
@@ -237,11 +257,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ جاري جلب التقويم الاقتصادي والأخبار وبيانات cTrader وتوليد التحليل...")
         report = await generate_analysis_report("EURUSD")
         
-        # إرسال التقرير بنص عادي متجنباً خطأ المارك داون من تلغرام
-        try:
-            await query.message.reply_text(report, parse_mode="Markdown")
-        except Exception:
-            await query.message.reply_text(report)
+        # إرسال التقرير النهائي بسلامة مع تقسيم الرسائل إن كانت طويلة
+        await send_long_message(chat_id=query.message.chat_id, text=report, context=context)
 
 # =====================================================================
 # 7. التشغيل الرئيسي (Main)
