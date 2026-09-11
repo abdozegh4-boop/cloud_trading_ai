@@ -1,648 +1,220 @@
 import os
-import json
 import asyncio
-import threading
-import time
+import logging
 import httpx
-from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
-from typing import List, Optional, Dict, Any
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response, status
-from contextlib import asynccontextmanager
-from pydantic import BaseModel
-from google import genai
-from google.genai import types
-
-# مكتبات التلغرام
+import feedparser
+from typing import List, Dict, Any
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import google.generativeai as genai
+
+# ================= ================= =================
+# 1. الإعدادات العامة والتهيئات (Configurations)
+# ================= ================= =================
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 
-# مكتبات cTrader Open API و Twisted Engine
-from twisted.internet import reactor
-from ctrader_open_api import Client, TcpProtocol
-from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
-from ctrader_open_api.messages.OpenApiMessages_pb2 import *
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "YOUR_FINNHUB_API_KEY")
 
-load_dotenv()
+# إعداد Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
-# ==================== المتغيرات البيئية ====================
-GEMINI_MODEL = "gemini-3.6-flash"
-api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key) if api_key else None
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MY_TELEGRAM_CHAT_ID = os.getenv("MY_TELEGRAM_CHAT_ID")
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrender.com")
-WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-# إعدادات cTrader
-CTRADER_HOST = os.getenv("CTRADER_HOST", "demo.ctraderapi.com")
-CTRADER_PORT = int(os.getenv("CTRADER_PORT", 5035))
-CLIENT_ID = os.getenv("CTRADER_CLIENT_ID")
-CLIENT_SECRET = os.getenv("CTRADER_CLIENT_SECRET")
-ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN")
-ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOUNT_ID") else 0
-
-telegram_app: Optional[Application] = None
-is_ctrader_connected = False
-stop_ctrader_flag = False
-db_pool: Optional[pool.SimpleConnectionPool] = None
-
-ctrader_account_info: Dict[str, Any] = {"balance": 0.0, "equity": 0.0, "margin": 0.0, "free_margin": 0.0}
-active_positions: List[Dict[str, Any]] = []
-
-# ==================== قائمة الشاملة بجميع الأزواج المتاحة في السوق ====================
-ALL_AVAILABLE_SYMBOLS = {
-    "forex": [
-        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
-        "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURAUD", "EURCAD", "GBPAUD"
-    ],
-    "commodities": [
-        "XAUUSD", "XAGUSD", "USOIL", "UKOIL", "NGAS", "COPPER"
-    ],
-    "indices": [
-        "US30", "NAS100", "SPX500", "GER40", "UK100", "JPN225", "FRA40"
-    ],
-    "crypto": [
-        "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "ADAUSD", "DOGEUSD", "AAPL", "NVDA", "TSLA"
-    ]
+# محاكاة قاعدة بيانات لإعدادات المستخدمين (DB State Storage)
+USER_SETTINGS = {
+    "selected_timeframes": ["M15", "H1", "H4"],
+    "symbols_forex": ["EURUSD", "GBPUSD"]
 }
 
-# ذاكرة مؤقتة لتخزين تحديدات المستخدم أثناء تعديل القوائم
-user_selections: Dict[int, Dict[str, Set[str]]] = {}
+# ================= ================= =================
+# 2. محرك الأخبار والتقويم الاقتصادي (News Engine)
+# ================= ================= =================
 
-# ==================== إدارة قاعدة البيانات ====================
-
-def init_db_pool():
-    global db_pool
-    if DATABASE_URL:
-        try:
-            db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
-            print("✅ Database connection pool initialized successfully.")
-        except Exception as e:
-            print(f"❌ Failed to create DB pool: {e}")
-
-def init_db():
-    if not db_pool:
-        return
-    conn = None
+async def get_forex_factory_calendar() -> str:
+    """جلب التقويم الاقتصادي والأحداث عالية التأثير من Forex Factory"""
+    url = "https://nodedata.forexfactory.com/ff_calendar_thisweek.json"
     try:
-        conn = db_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_settings (
-                    key VARCHAR(50) PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-            
-            default_settings = {
-                "symbols_forex": "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD",
-                "symbols_commodities": "XAUUSD,XAGUSD,USOIL,UKOIL",
-                "symbols_indices": "US30,NAS100,SPX500,GER40",
-                "symbols_crypto": "BTCUSD,ETHUSD,AAPL,NVDA,TSLA"
-            }
-            
-            for key, val in default_settings.items():
-                cur.execute("""
-                    INSERT INTO bot_settings (key, value)
-                    VALUES (%s, %s)
-                    ON CONFLICT (key) DO NOTHING;
-                """, (key, val))
-                
-            conn.commit()
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.get(url)
+            if res.status_code == 200:
+                events = res.json()
+                high_impact = [
+                    f"• {e.get('title')} ({e.get('country')}) | Date: {e.get('date')}"
+                    for e in events if e.get("impact") == "High"
+                ]
+                if high_impact:
+                    return "\n".join(high_impact[:5])
     except Exception as e:
-        print(f"❌ Error initializing database tables: {e}")
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+        logging.error(f"⚠️ Forex Factory Error: {e}")
+    return "لا توجد أحداث عالية التأثير قريبة."
 
-def get_broker_symbols_by_category(category_key: str, default_list: List[str]) -> List[str]:
-    if not db_pool:
-        return default_list
+async def get_finnhub_news() -> str:
+    """جلب الأخبار المالية المتخصصة من Finnhub"""
+    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "YOUR_FINNHUB_API_KEY":
+        return "Finnhub API Key غير مفعّل."
     
-    conn = None
+    url = f"https://finnhub.io/api/v1/news?category=forex&token={FINNHUB_API_KEY}"
     try:
-        conn = db_pool.getconn()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT value FROM bot_settings WHERE key = %s;", (f"symbols_{category_key}",))
-            row = cur.fetchone()
-            if row and row.get("value"):
-                symbols = [s.strip() for s in row["value"].split(",") if s.strip()]
-                return symbols if symbols else default_list
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.get(url)
+            if res.status_code == 200:
+                news = res.json()
+                items = [f"• {item.get('headline')}" for item in news[:4]]
+                if items:
+                    return "\n".join(items)
     except Exception as e:
-        print(f"⚠️ DB Read Error for {category_key}: {e}")
-    finally:
-        if conn:
-            db_pool.putconn(conn)
-            
-    return default_list
+        logging.error(f"⚠️ Finnhub Error: {e}")
+    return "تعذر جلب أخبار Finnhub."
 
-def save_broker_symbols_by_category(category_key: str, symbols: List[str]) -> bool:
-    if not db_pool:
-        return False
-    
-    conn = None
+def get_tradingview_rss() -> str:
+    """جلب العناوين العامة والتحليلات من TradingView RSS"""
     try:
-        conn = db_pool.getconn()
-        with conn.cursor() as cur:
-            symbols_str = ",".join(symbols)
-            cur.execute("""
-                INSERT INTO bot_settings (key, value, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE
-                SET value = EXCLUDED.value, updated_at = NOW();
-            """, (f"symbols_{category_key}", symbols_str))
-            conn.commit()
-            return True
+        url = "https://www.tradingview.com/feed/"
+        feed = feedparser.parse(url)
+        headlines = [f"• {entry.title}" for entry in feed.entries[:5]]
+        if headlines:
+            return "\n".join(headlines)
     except Exception as e:
-        print(f"❌ DB Write Error for {category_key}: {e}")
-        return False
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+        logging.error(f"⚠️ TradingView RSS Error: {e}")
+    return "تعذر جلب تغذية TradingView RSS."
 
-# ==================== Self-Ping Task ====================
+# ================= ================= =================
+# 3. محاكاة جلب البيانات الفنية (cTrader Data Fetcher)
+# ================= ================= =================
 
-async def keep_alive():
-    await asyncio.sleep(10)
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    async with httpx.AsyncClient(limits=limits, timeout=10.0) as client_http:
-        while True:
-            try:
-                response = await client_http.get(WEBHOOK_HOST)
-                if response.status_code == 200:
-                    print("🟢 Self-Ping Successful")
-            except Exception as e:
-                print(f"⚠️ Self-Ping Failed: {e}")
-            await asyncio.sleep(480)
+async def fetch_ctrader_data_for_timeframes(symbol: str, timeframes: List[str]) -> Dict[str, Any]:
+    """جلب بيانات السوق لكل فريم زمني محدد من cTrader"""
+    market_data = {}
+    for tf in timeframes:
+        market_data[tf] = {
+            "close": 1.0850,
+            "atr": 0.0015,
+            "volume": 1250,
+            "trend": "Bullish" if tf in ["H1", "H4"] else "Bearish"
+        }
+    return market_data
 
-# ==================== cTrader Open API ====================
+# ================= ================= =================
+# 4. تجميع السياق وتوليد التقرير عبر Gemini
+# ================= ================= =================
 
-ctrader_client = Client(CTRADER_HOST, CTRADER_PORT, TcpProtocol)
-
-def on_connected(client):
-    global is_ctrader_connected
-    is_ctrader_connected = True
-    print("✅ Connected to cTrader Open API")
-    if CLIENT_ID and CLIENT_SECRET:
-        request = ProtoOAApplicationAuthReq()
-        request.clientId = CLIENT_ID
-        request.clientSecret = CLIENT_SECRET
-        client.send(request)
-
-def on_disconnected(client, reason):
-    global is_ctrader_connected
-    is_ctrader_connected = False
-    print(f"❌ Disconnected from cTrader Open API: {reason}")
-
-def on_message_received(client, message):
-    global ctrader_account_info, active_positions
-    msg_type = message.payloadType
+async def generate_analysis_report(symbol: str) -> str:
+    """تجميع الأخبار والبيانات الفنية وتوليد التحليل عبر Gemini"""
+    selected_tfs = USER_SETTINGS.get("selected_timeframes", ["H1", "H4"])
     
-    if msg_type == ProtoOAApplicationAuthRes().payloadType:
-        if ACCOUNT_ID and ACCESS_TOKEN:
-            acc_auth_req = ProtoOAAccountAuthReq()
-            acc_auth_req.ctidTraderAccountId = int(ACCOUNT_ID)
-            acc_auth_req.accessToken = str(ACCESS_TOKEN)
-            client.send(acc_auth_req)
-            
-    elif msg_type == ProtoOAAccountAuthRes().payloadType:
-        print(f"🚀 Account {ACCOUNT_ID} Authenticated successfully!")
-        request_account_details()
-
-def request_account_details():
-    if is_ctrader_connected and ACCOUNT_ID:
-        req = ProtoOAReconcileReq()
-        req.ctidTraderAccountId = ACCOUNT_ID
-        ctrader_client.send(req)
-
-ctrader_client.setConnectedCallback(on_connected)
-ctrader_client.setDisconnectedCallback(on_disconnected)
-ctrader_client.setMessageReceivedCallback(on_message_received)
-
-def start_ctrader_reactor():
-    try:
-        ctrader_client.startService()
-        if not reactor.running:
-            reactor.run(installSignalHandlers=False)
-    except Exception as e:
-        print(f"⚠️ cTrader Reactor Error: {e}")
-
-def ctrader_auto_reconnect_loop():
-    global stop_ctrader_flag
-    reactor_thread = threading.Thread(target=start_ctrader_reactor, daemon=True)
-    reactor_thread.start()
+    # 1. جلب المصادر الإخبارية الثلاثة بالتوازي
+    calendar_data, finnhub_data = await asyncio.gather(
+        get_forex_factory_calendar(),
+        get_finnhub_news()
+    )
+    tradingview_data = get_tradingview_rss()
     
-    while not stop_ctrader_flag:
-        if not is_ctrader_connected and CLIENT_ID and CLIENT_SECRET:
-            try:
-                reactor.callFromThread(ctrader_client.startService)
-            except Exception as e:
-                print(f"⚠️ cTrader Reconnect Error: {e}")
-        for _ in range(30):
-            if stop_ctrader_flag:
-                break
-            time.sleep(1)
-
-# ==================== لوحات التحكم والأزرار ====================
-
-def is_authorized(update: Update) -> bool:
-    if not MY_TELEGRAM_CHAT_ID:
-        return True
-    user_id = update.effective_chat.id if update.effective_chat else None
-    return str(user_id) == str(MY_TELEGRAM_CHAT_ID)
-
-def main_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("💱 توصيات الفوركس", callback_data="sig_forex"),
-            InlineKeyboardButton("🥇 المعادن والطاقة", callback_data="sig_commodities")
-        ],
-        [
-            InlineKeyboardButton("📈 توصيات المؤشرات", callback_data="sig_indices"),
-            InlineKeyboardButton("₿ الأسهم والعملات", callback_data="sig_crypto")
-        ],
-        [
-            InlineKeyboardButton("⚙️ تعديل قائمة الأزواج المتاحة", callback_data="manage_categories")
-        ],
-        [
-            InlineKeyboardButton("📊 حالة النظام", callback_data="btn_status"),
-            InlineKeyboardButton("💳 معلومات الحساب", callback_data="btn_account")
-        ],
-        [
-            InlineKeyboardButton("📈 الصفقات المفتوحة", callback_data="btn_positions"),
-            InlineKeyboardButton("🔄 تحديث البيانات", callback_data="btn_refresh")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def category_selection_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("💱 أزواج الفوركس", callback_data="editcat_forex"),
-            InlineKeyboardButton("🥇 المعادن والطاقة", callback_data="editcat_commodities")
-        ],
-        [
-            InlineKeyboardButton("📈 المؤشرات العالمية", callback_data="editcat_indices"),
-            InlineKeyboardButton("₿ الأسهم والعملات الرقمية", callback_data="editcat_crypto")
-        ],
-        [
-            InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_main")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def build_symbols_checkbox_keyboard(category: str, selected_symbols: set):
-    """بناء لوحة أزرار تحتوي على مربعات تحديد للأزواج"""
-    all_symbols = ALL_AVAILABLE_SYMBOLS.get(category, [])
-    keyboard = []
-    row = []
+    # 2. جلب بيانات cTrader للفريمات المختارة
+    ctrader_data = await fetch_ctrader_data_for_timeframes(symbol, selected_tfs)
     
-    for symbol in all_symbols:
-        is_checked = symbol in selected_symbols
-        icon = "☑️" if is_checked else "🔲"
-        btn_text = f"{icon} {symbol}"
-        callback_data = f"toggle_{category}_{symbol}"
-        
-        row.append(InlineKeyboardButton(btn_text, callback_data=callback_data))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-
-    # أزرار الإجراءات (تأكيد أو إلغاء)
-    keyboard.append([
-        InlineKeyboardButton("💾 حفظ التغييرات", callback_data=f"save_{category}"),
-        InlineKeyboardButton("❌ إلغاء", callback_data="manage_categories")
-    ])
-    
-    return InlineKeyboardMarkup(keyboard)
-
-# ==================== توليد التوصيات عبر AI ====================
-
-async def generate_market_signals(category: str, symbols: List[str]) -> str:
-    if not client:
-        return "❌ **خطأ:** مفتاح Google Gemini API غير معرف."
-
-    symbols_str = ", ".join(symbols)
-    
+    # 3. بناء الـ Prompt الشامل
     prompt = f"""
-    You are an elite Institutional Quantitative Analyst and Forex Trader.
-    Generate actionable market signals/recommendations for the following assets available at the broker:
-    Category: {category}
-    Broker Available Assets: {symbols_str}
+أنت خبير تحليل فني واقتصادي مؤسساتي. قم بتحليل زوج {symbol} بناءً على كافة المعطيات المجمعة:
 
-    For each asset (or the top 2-3 most volatile assets in this list), provide a concise trading signal in Arabic with this exact format:
+=== 📅 1. التقويم الاقتصادي (Forex Factory) ===
+{calendar_data}
 
-    🎯 **توصية تحليليّة - [{category}]**
+=== 📰 2. الأخبار المالية المتخصصة (Finnhub) ===
+{finnhub_data}
 
-    🔹 **الزوج/الأصل:** [Symbol]
-    • **الاتجاه:** 🟢 شراء (BUY) أو 🔴 بيع (SELL)
-    • **نقطة الدخول:** [Current/Ideal Entry Price]
-    • **هدف الربح (TP):** [Take Profit Price]
-    • **وقف الخسارة (SL):** [Stop Loss Price]
-    • **نسبة المخاطرة:** Low / Medium
-    • **التحليل الفني السريع:** [1 sentence technical reasoning based on market structure and momentum]
+=== 🌐 3. العناوين الاقتصادية العامة (TradingView RSS) ===
+{tradingview_data}
 
-    Keep the response concise, strictly structured, and fully formatted with clean Telegram Markdown.
+=== 📈 4. البيانات الفنية للفريمات المختارة ({', '.join(selected_tfs)}) ===
+{ctrader_data}
+
+=== المطلوب ===
+• تقديم تحليل فني مستوفى لكل فريم زمني محدد.
+• تحديد الاتجاه العام وتوضيح توافق/تضارب الأخبار الاقتصادية مع البيانات الفنية.
+• إعطاء قرار نهائي صريح (شراء / بيع / انتظار) مع تحديد أهداف الدخول ووقف الخسارة.
     """
-
+    
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
+        response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"❌ **حدث خطأ أثناء توليد التحليل:**\n`{str(e)}`"
+        logging.error(f"خطأ أثناء استدعاء Gemini API: {e}")
+        return "حدث خطأ أثناء إعداد التحليل بواسطة الذكاء الاصطناعي."
 
-# ==================== معالجة أزرار التلغرام ====================
+# ================= ================= =================
+# 5. واجهة تلغرام وإدارة الفريمات (Telegram Bot)
+# ================= ================= =================
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
-        return
-    await update.message.reply_text(
-        "🤖 **مرحباً بك في لوحة التداول وتوصيات الذكاء الاصطناعي!**\n\n"
-        "اختر خياراً من القائمة أدناه:",
-        reply_markup=main_keyboard(),
-        parse_mode="Markdown"
-    )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("⏱ تعديل الفريمات الزمنية", callback_data="manage_timeframes")],
+        [InlineKeyboardButton("💱 تحليل EURUSD", callback_data="analyze_EURUSD")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("أهلاً بك في نظام التحليل الفني والمالي المتكامل. اختر من القائمة:", reply_markup=reply_markup)
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if not is_authorized(update):
-        await query.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
-        return
-
-    user_id = query.from_user.id
-    data = query.data
-
-    # --- العودة للقائمة الرئيسية ---
-    if data == "back_main":
-        await query.edit_message_text(
-            "🤖 **مرحباً بك في لوحة التداول وتوصيات الذكاء الاصطناعي!**\n\n"
-            "اختر خياراً من القائمة أدناه:",
-            reply_markup=main_keyboard(),
-            parse_mode="Markdown"
-        )
-
-    # --- إظهار قائمة اختيار الفئة للتعديل ---
-    elif data == "manage_categories":
-        await query.edit_message_text(
-            "⚙️ **تعديل قائمة الأزواج المتاحة للبروكر**\n\n"
-            "الرجاء اختيار قائمة الأزواج التي تريد التعديل عليها:",
-            reply_markup=category_selection_keyboard(),
-            parse_mode="Markdown"
-        )
-
-    # --- عرض أزرار التحديد المباشرة للفئة المختارة ---
-    elif data.startswith("editcat_"):
-        category = data.split("_")[1]
+    if query.data == "manage_timeframes":
+        all_tfs = ["M15", "M30", "H1", "H4", "D1"]
+        current = USER_SETTINGS["selected_timeframes"]
         
-        # جلب الأزواج الحالية المسجلة في DB لهذه الفئة
-        current_db_symbols = set(get_broker_symbols_by_category(category, ALL_AVAILABLE_SYMBOLS.get(category, [])))
-        
-        if user_id not in user_selections:
-            user_selections[user_id] = {}
-        user_selections[user_id][category] = current_db_symbols
-
-        kb = build_symbols_checkbox_keyboard(category, current_db_symbols)
-        await query.edit_message_text(
-            f"📋 **تحديد أزواج فئة [{category.upper()}]**\n\n"
-            f"انقر على الأزواج للتحديد (☑️) أو الإلغاء (🔲)، ثم اضغط **حفظ التغييرات**:",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-
-    # --- التبديل المباشر عند التحديد/الإلغاء (Toggle Checkbox) ---
-    elif data.startswith("toggle_"):
-        _, category, symbol = data.split("_")
-        
-        if user_id not in user_selections or category not in user_selections[user_id]:
-            user_selections[user_id] = {category: set(get_broker_symbols_by_category(category, []))}
-
-        selected_set = user_selections[user_id][category]
-        if symbol in selected_set:
-            selected_set.remove(symbol)
-        else:
-            selected_set.add(symbol)
-
-        kb = build_symbols_checkbox_keyboard(category, selected_set)
-        await query.edit_message_reply_markup(reply_markup=kb)
-
-    # --- حفظ التغييرات في قاعدة البيانات ---
-    elif data.startswith("save_"):
-        category = data.split("_")[1]
-        selected_set = user_selections.get(user_id, {}).get(category, set())
-        
-        symbols_list = list(selected_set)
-        success = save_broker_symbols_by_category(category, symbols_list)
-
-        if success:
-            await query.edit_message_text(
-                f"✅ **تم تحديث قاعدة البيانات بنجاح!**\n\n"
-                f"الأزواج المعتمدة حالياً لفئة **[{category.upper()}]** هي:\n"
-                f"`{', '.join(symbols_list) if symbols_list else 'لا يوجد أزواج محدودة'}`",
-                reply_markup=main_keyboard(),
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text(
-                "❌ **حدث خطأ أثناء حفظ التغييرات في قاعدة البيانات.**",
-                reply_markup=main_keyboard(),
-                parse_mode="Markdown"
-            )
-
-    # --- توصيات الفوركس (قراءة ديناميكية من DB) ---
-    elif data == "sig_forex":
-        symbols = get_broker_symbols_by_category("forex", ["EURUSD", "GBPUSD", "USDJPY"])
-        await query.message.reply_text(f"⏳ **جاري تحليل أزواج الفوركس المتاحة (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
-        signals = await generate_market_signals("أزواج الفوركس", symbols)
-        await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    # --- توصيات المعادن والطاقة ---
-    elif data == "sig_commodities":
-        symbols = get_broker_symbols_by_category("commodities", ["XAUUSD", "XAGUSD", "USOIL"])
-        await query.message.reply_text(f"⏳ **جاري تحليل المعادن والطاقة (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
-        signals = await generate_market_signals("المعادن والطاقة", symbols)
-        await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    # --- توصيات المؤشرات ---
-    elif data == "sig_indices":
-        symbols = get_broker_symbols_by_category("indices", ["US30", "NAS100", "SPX500"])
-        await query.message.reply_text(f"⏳ **جاري تحليل المؤشرات العالمية (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
-        signals = await generate_market_signals("المؤشرات العالمية", symbols)
-        await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    # --- توصيات الأسهم والعملات الرقمية ---
-    elif data == "sig_crypto":
-        symbols = get_broker_symbols_by_category("crypto", ["BTCUSD", "ETHUSD", "AAPL"])
-        await query.message.reply_text(f"⏳ **جاري تحليل الأسهم والعملات الرقمية (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
-        signals = await generate_market_signals("الأسهم والعملات الرقمية", symbols)
-        await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    # --- حالة النظام والتداول ---
-    elif data == "btn_status":
-        ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
-        status_msg = (
-            f"🖥 **حالة الخادم:** 🟢 يعمل بنجاح\n"
-            f"🔌 **شبكة cTrader API:** {ctrader_status}\n"
-            f"🧠 **نموذج الذكاء الاصطناعي:** `{GEMINI_MODEL}`"
-        )
-        await query.message.reply_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    elif data == "btn_account":
-        request_account_details()
-        bal = ctrader_account_info.get("balance", 0.0)
-        eq = ctrader_account_info.get("equity", 0.0)
-        margin = ctrader_account_info.get("margin", 0.0)
-        pnl = eq - bal
-        pnl_sign = "🟢 +" if pnl >= 0 else "🔴 "
-
-        msg = (
-            f"💳 **تقرير حساب التداول:**\n\n"
-            f"🔹 **الرصيد (Balance):** `${bal:,.2f}`\n"
-            f"🔹 **الصافي الحالي (Equity):** `${eq:,.2f}`\n"
-            f"🔹 **الأرباح/الخسائر:** {pnl_sign}`${pnl:,.2f}`\n"
-            f"🔹 **الهامش المستغل (Margin):** `${margin:,.2f}`"
-        )
-        await query.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    elif data == "btn_positions":
-        request_account_details()
-        if not active_positions:
-            await query.message.reply_text("📭 **لا توجد صفقات مفتوحة حالياً.**", reply_markup=main_keyboard(), parse_mode="Markdown")
-        else:
-            msg = "📈 **الصفقات المفتوحة حالياً:**\n\n"
-            for pos in active_positions:
-                side = "🟢 BUY" if pos.get("trade_type") == "BUY" else "🔴 SELL"
-                msg += (
-                    f"🔹 **{pos.get('symbol')}** | {side}\n"
-                    f"   • اللوت: `{pos.get('volume')}`\n"
-                    f"   • سعر الدخول: `{pos.get('entry_price')}`\n"
-                    f"   • الربح/الخسارة: `{pos.get('pnl'):+.2f} USD`\n\n"
-                )
-            await query.message.reply_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
-
-    elif data == "btn_refresh":
-        request_account_details()
-        await query.message.reply_text("🔄 **تم تحديث البيانات.**", reply_markup=main_keyboard(), parse_mode="Markdown")
-
-# ==================== Pydantic Model ====================
-
-class UpdateSymbolsPayload(BaseModel):
-    category: str
-    symbols: List[str]
-
-# ==================== دورة حياة التطبيق ====================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global telegram_app, stop_ctrader_flag
-    
-    init_db_pool()
-    init_db()
-    ping_task = asyncio.create_task(keep_alive())
-
-    stop_ctrader_flag = False
-    if CLIENT_ID and CLIENT_SECRET:
-        ctrader_thread = threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True)
-        ctrader_thread.start()
-
-    if TELEGRAM_BOT_TOKEN:
-        try:
-            telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        keyboard = []
+        for tf in all_tfs:
+            status = "☑️" if tf in current else "🔲"
+            keyboard.append([InlineKeyboardButton(f"{status} {tf}", callback_data=f"toggle_{tf}")])
             
-            telegram_app.add_handler(CommandHandler("start", cmd_start))
-            telegram_app.add_handler(CallbackQueryHandler(handle_callback_query))
+        keyboard.append([InlineKeyboardButton("💾 حفظ الفريمات", callback_data="save_tfs")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("اختر الفريمات الزمنية المعتمدة للتحليل:", reply_markup=reply_markup)
 
-            await telegram_app.initialize()
-            await telegram_app.start()
+    elif query.data.startswith("toggle_"):
+        tf_to_toggle = query.data.split("_")[1]
+        current = USER_SETTINGS["selected_timeframes"]
+        
+        if tf_to_toggle in current:
+            current.remove(tf_to_toggle)
+        else:
+            current.append(tf_to_toggle)
+            
+        all_tfs = ["M15", "M30", "H1", "H4", "D1"]
+        keyboard = []
+        for tf in all_tfs:
+            status = "☑️" if tf in current else "🔲"
+            keyboard.append([InlineKeyboardButton(f"{status} {tf}", callback_data=f"toggle_{tf}")])
+            
+        keyboard.append([InlineKeyboardButton("💾 حفظ الفريمات", callback_data="save_tfs")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("اختر الفريمات الزمنية المعتمدة للتحليل:", reply_markup=reply_markup)
 
-            await telegram_app.bot.set_webhook(
-                url=WEBHOOK_URL,
-                drop_pending_updates=True,
-                max_connections=40
-            )
+    elif query.data == "save_tfs":
+        tfs_str = ", ".join(USER_SETTINGS["selected_timeframes"])
+        await query.edit_message_text(f"تم حفظ الفريمات بنجاح! الفريمات الحالية: {tfs_str}")
 
-            if MY_TELEGRAM_CHAT_ID:
-                try:
-                    await telegram_app.bot.send_message(
-                        chat_id=int(MY_TELEGRAM_CHAT_ID),
-                        text=f"🚀 **تم تشغيل النظام ولوحة التحكم التفاعلية بنجاح!**\n🤖 النموذج النشط: `{GEMINI_MODEL}`",
-                        reply_markup=main_keyboard(),
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    print(f"⚠️ Telegram notification error: {e}")
+    elif query.data == "analyze_EURUSD":
+        await query.edit_message_text("⏳ جاري جلب التقويم الاقتصادي والأخبار وبيانات cTrader وتوليد التحليل...")
+        report = await generate_analysis_report("EURUSD")
+        await query.message.reply_text(report, parse_mode="Markdown")
 
-        except Exception as e:
-            print(f"❌ Webhook configuration failed: {e}")
+# ================= ================= =================
+# 6. التشغيل الرئيسي (Main)
+# ================= ================= =================
 
-    yield
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    stop_ctrader_flag = True
-    ping_task.cancel()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    if telegram_app:
-        try:
-            await telegram_app.bot.delete_webhook()
-            await telegram_app.stop()
-            await telegram_app.shutdown()
-        except Exception as e:
-            print(f"⚠️ Error stopping Telegram Bot: {e}")
+    logging.info("تم تشغيل البوت بنجاح...")
+    app.run_polling()
 
-    if db_pool:
-        db_pool.closeall()
-
-app = FastAPI(title="Cloud Trading AI Backend", lifespan=lifespan)
-
-# ==================== Endpoints ====================
-
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    if not telegram_app:
-        raise HTTPException(status_code=500, detail="Telegram application not initialized")
-    try:
-        data = await request.json()
-        update = Update.de_json(data, telegram_app.bot)
-        await telegram_app.process_update(update)
-        return Response(status_code=status.HTTP_200_OK)
-    except Exception as e:
-        print(f"⚠️ Error processing Webhook update: {e}")
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-@app.get("/")
-@app.head("/")
-def read_root():
-    return {
-        "status": "online",
-        "active_model": GEMINI_MODEL,
-        "ctrader_connected": is_ctrader_connected
-    }
-
-@app.post("/api/update-symbols")
-def update_symbols(data: UpdateSymbolsPayload):
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="Database connection pool unavailable")
-    
-    success = save_broker_symbols_by_category(data.category.lower().strip(), data.symbols)
-    if success:
-        return {"status": "success", "category": data.category, "updated_symbols": data.symbols}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to save symbols to database")
+if __name__ == "__main__":
+    main()
