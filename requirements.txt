@@ -7,3 +7,8 @@ google-genai
 python-telegram-bot
 ctrader-open-api
 service_identity
+feedparser==6.0.11
+httpx==0.28.1
+feedparser
+httpx
+psycopg2-binary
