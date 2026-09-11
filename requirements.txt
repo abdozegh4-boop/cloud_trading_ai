@@ -12,3 +12,4 @@ httpx==0.28.1
 feedparser
 httpx
 psycopg2-binary
+google-generativeai
