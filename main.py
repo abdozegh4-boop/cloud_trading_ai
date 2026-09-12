@@ -36,7 +36,7 @@ logger = logging.getLogger("TradingBot")
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
