@@ -339,7 +339,7 @@ async def post_init(application):
     logging.info("تم مسح الـ Webhook القديم بنجاح بنسبة 100%.")
 
 def main():
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+    if TELEGRAM_BOT_TOKEN == "8624993506:AAEZO-faBjZ7fbFx36zrry7pwBu6UDPJAbc":
         raise ValueError("يرجى إدخال TELEGRAM_BOT_TOKEN في متغيرات البيئة!")
 
     telegram_app = (
