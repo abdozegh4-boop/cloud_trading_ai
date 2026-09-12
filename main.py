@@ -282,7 +282,7 @@ def on_message_received(client, message):
                 "trade_type": "BUY" if pos.tradeData.tradeSide == ProtoOATradeSide.BUY else "SELL",
                 "volume": pos.tradeData.volume / 100000.0,
                 "entry_price": pos.price,
-                "pnl": pos.utcLastUpdateTimestamp / 100.0  # تقريبي
+                "pnl": pos.utcLastUpdateTimestamp / 100.0
             })
         logger.info(f"Account Reconciled: Balance ${ctrader_account_info['balance']}, Open Positions: {len(active_positions)}")
 
@@ -299,17 +299,18 @@ def request_symbol_trendbars(symbol_name: str, timeframe: str = "H1"):
     symbol_id = symbol_id_map[symbol_name]
     pending_requests_tf[symbol_id] = timeframe
     
+    # استخدام ProtoOATrendbarPeriod الصحيح
     period_map = {
-        "M15": ProtoMAPeriod.M15,
-        "H1": ProtoMAPeriod.H1,
-        "H4": ProtoMAPeriod.H4,
-        "D1": ProtoMAPeriod.D1
+        "M15": ProtoOATrendbarPeriod.M15,
+        "H1": ProtoOATrendbarPeriod.H1,
+        "H4": ProtoOATrendbarPeriod.H4,
+        "D1": ProtoOATrendbarPeriod.D1
     }
     
     req = ProtoOAGetTrendbarsReq()
     req.ctidTraderAccountId = ACCOUNT_ID
     req.symbolId = symbol_id
-    req.period = period_map.get(timeframe, ProtoMAPeriod.H1)
+    req.period = period_map.get(timeframe, ProtoOATrendbarPeriod.H1)
     req.fromTimestamp = int((time.time() - 86400 * 30) * 1000) # جلب 30 يوماً لحساب المؤشرات بدقة
     req.toTimestamp = int(time.time() * 1000)
     
@@ -451,7 +452,6 @@ def main_keyboard(user_id: int):
         [
             InlineKeyboardButton(f"⏱️ الأطر الزمنية المشتركة ({tfs_count})", callback_data="open_timeframes_menu")
         ],
-        # ZER NEW: المؤشرات الفنية المباشرة
         [
             InlineKeyboardButton("📊 المؤشرات الفنية الرقمية (Volume, RSI, EMA, ATR)", callback_data="calc_indicators")
         ],
