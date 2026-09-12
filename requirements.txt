@@ -7,3 +7,4 @@ feedparser
 ctrader-open-api
 service_identity
 psycopg2-binary
+python-dotenv
