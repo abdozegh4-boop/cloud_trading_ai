@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 import logging
+import math
 import httpx
 import feedparser
 from typing import List, Optional, Dict, Any, Set
@@ -35,7 +36,7 @@ logger = logging.getLogger("TradingBot")
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
@@ -59,12 +60,14 @@ telegram_app: Optional[Application] = None
 is_ctrader_connected = False
 stop_ctrader_flag = False
 
-# بيانات الحساب
+# بيانات الحساب والصفقات
 ctrader_account_info: Dict[str, Any] = {"balance": 0.0, "equity": 0.0, "margin": 0.0, "free_margin": 0.0}
 active_positions: List[Dict[str, Any]] = []
 
 symbol_id_map: Dict[str, int] = {}
+symbol_id_to_name: Dict[int, str] = {}
 trendbars_cache: Dict[str, Dict[str, Any]] = {}
+pending_requests_tf: Dict[int, str] = {}  # لتتبع الإطار الزمني للطلبات المرسلة
 
 # الأطر الزمنية والأزواج المتاحة
 AVAILABLE_TIMEFRAMES = ["M15", "H1", "H4", "D1"]
@@ -79,6 +82,72 @@ ALL_AVAILABLE_SYMBOLS = {
     "indices": ["US30", "NAS100", "SPX500", "GER40", "UK100"],
     "crypto": ["BTCUSD", "ETHUSD", "SOLUSD", "AAPL", "NVDA", "TSLA"]
 }
+
+# ==================== Technical Analysis Engine ====================
+
+def calculate_technical_indicators(bars: List[Any]) -> Dict[str, Any]:
+    """
+    تستقبل قائمة من trendbars القادمة من cTrader وتحسب:
+    RSI (14), EMA (20), EMA (50), ATR (14), والـ Volume الأخير.
+    """
+    if len(bars) < 50:
+        return {"error": "عدد الشموع غير كافٍ لحساب المؤشرات (يُشترط 50 شمعة على الأقل)"}
+
+    closes = [(b.low + b.deltaClose) / 100000.0 for b in bars]
+    highs = [(b.low + b.deltaHigh) / 100000.0 for b in bars]
+    lows = [b.low / 100000.0 for b in bars]
+    volumes = [b.volume for b in bars]
+
+    last_volume = volumes[-1]
+
+    def calc_ema(period: int, prices: List[float]) -> float:
+        k = 2 / (period + 1)
+        ema = sum(prices[:period]) / period
+        for price in prices[period:]:
+            ema = (price * k) + (ema * (1 - k))
+        return ema
+
+    ema_20 = calc_ema(20, closes)
+    ema_50 = calc_ema(50, closes)
+
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(diff if diff > 0 else 0.0)
+        losses.append(abs(diff) if diff < 0 else 0.0)
+
+    avg_gain = sum(gains[:14]) / 14
+    avg_loss = sum(losses[:14]) / 14
+
+    for i in range(14, len(gains)):
+        avg_gain = (avg_gain * 13 + gains[i]) / 14
+        avg_loss = (avg_loss * 13 + losses[i]) / 14
+
+    if avg_loss == 0:
+        rsi_14 = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_14 = 100 - (100 / (1 + rs))
+
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        tr_list.append(tr)
+
+    atr_14 = sum(tr_list[-14:]) / 14
+
+    return {
+        "last_price": round(closes[-1], 5),
+        "volume": last_volume,
+        "rsi_14": round(rsi_14, 2),
+        "ema_20": round(ema_20, 5),
+        "ema_50": round(ema_50, 5),
+        "atr_14": round(atr_14, 5)
+    }
 
 # ==================== Data Aggregation Layer ====================
 
@@ -156,7 +225,7 @@ def on_disconnected(client, reason):
     logger.warning(f"Disconnected from cTrader Open API: {reason}")
 
 def on_message_received(client, message):
-    global symbol_id_map, trendbars_cache, ctrader_account_info
+    global symbol_id_map, symbol_id_to_name, trendbars_cache, ctrader_account_info, active_positions
     msg_type = message.payloadType
     
     if msg_type == ProtoOAApplicationAuthRes().payloadType:
@@ -177,15 +246,45 @@ def on_message_received(client, message):
         res.ParseFromString(message.payload)
         for s in res.symbol:
             symbol_id_map[s.symbolName] = s.symbolId
+            symbol_id_to_name[s.symbolId] = s.symbolName
         logger.info(f"Loaded {len(symbol_id_map)} Symbol IDs from Broker.")
 
     elif msg_type == ProtoOAGetTrendbarsRes().payloadType:
         res = ProtoOAGetTrendbarsRes()
         res.ParseFromString(message.payload)
+        
+        # ربط الشموع بالزوج والإطار الزمني في الكاش
+        sym_name = symbol_id_to_name.get(res.symbolId, "UNKNOWN")
+        tf = pending_requests_tf.get(res.symbolId, "H1")
+        
         if len(res.trendbar) > 0:
+            if sym_name not in trendbars_cache:
+                trendbars_cache[sym_name] = {}
+            trendbars_cache[sym_name][tf] = list(res.trendbar)
             last_bar = res.trendbar[-1]
             close_price = (last_bar.low + last_bar.deltaClose) / 100000.0
-            logger.info(f"Trendbar Received - Bars: {len(res.trendbar)}, Latest Close: {close_price}")
+            logger.info(f"Trendbar Received [{sym_name} - {tf}] - Bars: {len(res.trendbar)}, Latest Close: {close_price}")
+
+    elif msg_type == ProtoOAReconcileRes().payloadType:
+        res = ProtoOAReconcileRes()
+        res.ParseFromString(message.payload)
+        if hasattr(res, 'account'):
+            ctrader_account_info["balance"] = res.account.balance / 100.0
+            ctrader_account_info["equity"] = res.account.balance / 100.0
+        
+        # تفريغ وتحديث قائمة الصفقات المفتوحة
+        active_positions.clear()
+        for pos in res.position:
+            sym_name = symbol_id_to_name.get(pos.tradeData.symbolId, f"ID_{pos.tradeData.symbolId}")
+            active_positions.append({
+                "position_id": pos.positionId,
+                "symbol": sym_name,
+                "trade_type": "BUY" if pos.tradeData.tradeSide == ProtoOATradeSide.BUY else "SELL",
+                "volume": pos.tradeData.volume / 100000.0,
+                "entry_price": pos.price,
+                "pnl": pos.utcLastUpdateTimestamp / 100.0  # تقريبي
+            })
+        logger.info(f"Account Reconciled: Balance ${ctrader_account_info['balance']}, Open Positions: {len(active_positions)}")
 
 def request_account_details():
     if is_ctrader_connected and ACCOUNT_ID:
@@ -198,11 +297,20 @@ def request_symbol_trendbars(symbol_name: str, timeframe: str = "H1"):
         return
     
     symbol_id = symbol_id_map[symbol_name]
+    pending_requests_tf[symbol_id] = timeframe
+    
+    period_map = {
+        "M15": ProtoMAPeriod.M15,
+        "H1": ProtoMAPeriod.H1,
+        "H4": ProtoMAPeriod.H4,
+        "D1": ProtoMAPeriod.D1
+    }
+    
     req = ProtoOAGetTrendbarsReq()
     req.ctidTraderAccountId = ACCOUNT_ID
     req.symbolId = symbol_id
-    req.period = ProtoMAPeriod.H1 if timeframe == "H1" else ProtoMAPeriod.M15
-    req.fromTimestamp = int((time.time() - 86400 * 5) * 1000)
+    req.period = period_map.get(timeframe, ProtoMAPeriod.H1)
+    req.fromTimestamp = int((time.time() - 86400 * 30) * 1000) # جلب 30 يوماً لحساب المؤشرات بدقة
     req.toTimestamp = int(time.time() * 1000)
     
     ctrader_client.send(req)
@@ -303,7 +411,6 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
         """
 
     try:
-        # تشغيل استدعاء Gemini بشكل غير معطل (Non-Blocking) لمنع تجميد الخادم والتسبب بـ Timeout
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
@@ -344,7 +451,10 @@ def main_keyboard(user_id: int):
         [
             InlineKeyboardButton(f"⏱️ الأطر الزمنية المشتركة ({tfs_count})", callback_data="open_timeframes_menu")
         ],
-        # أزرار التحليل المخصصة
+        # ZER NEW: المؤشرات الفنية المباشرة
+        [
+            InlineKeyboardButton("📊 المؤشرات الفنية الرقمية (Volume, RSI, EMA, ATR)", callback_data="calc_indicators")
+        ],
         [
             InlineKeyboardButton("📅 تحليل التقويم (Forex Factory)", callback_data="analyze_forexfactory")
         ],
@@ -420,7 +530,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "🚀 **مرحباً بك في لوحة التداول الذكية المخصصة!**\n\n"
         "• قم باختيار **الأزواج** و **الأطر الزمنية المشتركة**.\n"
-        "• يمكنك الآن الضغط على زر التحليل الخاص بكل مصدر (Forex Factory, Finnhub, TradingView) للحصول على تقرير مخصص، أو استخدام زر **التوصية الموحدة الشاملة**."
+        "• يمكنك حساب **المؤشرات الفنية المباشرة**، إجراء تحليل خاص بكل مصدر، أو توليد **التوصية الموحدة الشاملة**."
     )
     await update.message.reply_text(
         welcome_text,
@@ -431,7 +541,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
-    # الرد المباشر لإنهاء حالة التحميل على زر التلغرام
     try:
         await query.answer()
     except Exception as e:
@@ -486,7 +595,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     current_syms.remove(sym)
                 else:
                     current_syms.append(sym)
-                    request_symbol_trendbars(sym, "H1")
+                    # طلب الشموع للأطر المختارة فوراً عند اختيار الزوج
+                    for tf in user_selected_tfs.get(user_id, ["H1"]):
+                        request_symbol_trendbars(sym, tf)
 
                 user_selected_symbols[user_id] = current_syms
                 await query.edit_message_reply_markup(reply_markup=symbol_picker_keyboard(user_id, category))
@@ -509,11 +620,67 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         current_tfs.remove(tf)
                 else:
                     current_tfs.append(tf)
+                    # طلب الشموع للأزواج المختارة عند اختيار إطار جديد
+                    for sym in user_selected_symbols.get(user_id, []):
+                        request_symbol_trendbars(sym, tf)
                     
                 user_selected_tfs[user_id] = current_tfs
                 await query.edit_message_reply_markup(reply_markup=shared_tf_keyboard(user_id))
 
-        # أزرار التحليل المخصصة
+        # معالجة زر المؤشرات الفنية الرقمية المباشرة
+        elif data == "calc_indicators":
+            selected_syms = user_selected_symbols.get(user_id, [])
+            selected_tfs = user_selected_tfs.get(user_id, ["H1"])
+
+            if not selected_syms:
+                await query.edit_message_text(
+                    "⚠️ **لم تقم باختيار أي زوج!**\nالرجاء اختيار زوج واحد على الأقل للبدء.",
+                    reply_markup=main_keyboard(user_id),
+                    parse_mode="Markdown"
+                )
+                return
+
+            await query.edit_message_text(
+                "⏳ **جاري حساب المؤشرات الفنية المباشرة من cTrader...**",
+                parse_mode="Markdown"
+            )
+
+            report_lines = ["📊 **التقرير الفني الرقمي المباشر**\n"]
+
+            for sym in selected_syms:
+                report_lines.append(f"🔹 **الزوج:** `{sym}`")
+                sym_data = trendbars_cache.get(sym, {})
+                
+                for tf in selected_tfs:
+                    bars = sym_data.get(tf, [])
+                    if not bars:
+                        request_symbol_trendbars(sym, tf)
+                        report_lines.append(f"  • **الإطار [{tf}]:** ⚠️ `جاري جلب الشموع، أعد المحاولة بعد ثوانٍ`")
+                        continue
+
+                    indicators = calculate_technical_indicators(bars)
+                    if "error" in indicators:
+                        report_lines.append(f"  • **الإطار [{tf}]:** ⚠️ `{indicators['error']}`")
+                    else:
+                        report_lines.append(
+                            f"  ⏱️ **إطار [{tf}]:**\n"
+                            f"     • **السعر الحالي:** `{indicators['last_price']}`\n"
+                            f"     • **RSI (14):** `{indicators['rsi_14']}`\n"
+                            f"     • **ATR (14):** `{indicators['atr_14']}`\n"
+                            f"     • **EMA (20):** `{indicators['ema_20']}` | **EMA (50):** `{indicators['ema_50']}`\n"
+                            f"     • **Volume:** `{indicators['volume']:,}`\n"
+                        )
+                report_lines.append("")
+
+            final_report = "\n".join(report_lines)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=final_report,
+                reply_markup=main_keyboard(user_id),
+                parse_mode="Markdown"
+            )
+
+        # أزرار التحليل المخصصة عبر الذكاء الاصطناعي
         elif data in ["analyze_forexfactory", "analyze_finnhub", "analyze_tradingview", "run_full_analysis"]:
             selected_syms = user_selected_symbols.get(user_id, [])
             selected_tfs = user_selected_tfs.get(user_id, ["H1"])
@@ -535,7 +702,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
             label_name, internal_type = type_labels[data]
 
-            # 1. إظهار رسالة الانتظار فوراً للمستخدم
             await query.edit_message_text(
                 f"⏳ **جاري جلب معطيات [{label_name}]...**\n"
                 f"• **الأزواج:** `{', '.join(selected_syms)}`\n"
@@ -544,7 +710,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
-            # 2. جلب وتوليد البيانات بأسلوب غير معطل للـ Bot Async Execution
             try:
                 aggregated = await aggregate_multi_symbols_data(selected_syms)
                 report = await run_specific_analysis(internal_type, aggregated, selected_tfs)
@@ -608,7 +773,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif data == "btn_refresh":
             request_account_details()
-            await query.edit_message_text("🔄 **تم تحديث البيانات بنجاح!**", reply_markup=main_keyboard(user_id), parse_mode="Markdown")
+            # تحديث الشموع للأزواج الحالية
+            for sym in user_selected_symbols.get(user_id, []):
+                for tf in user_selected_tfs.get(user_id, ["H1"]):
+                    request_symbol_trendbars(sym, tf)
+            await query.edit_message_text("🔄 **تم تحديث البيانات وإرسال طلبات الشموع بنجاح!**", reply_markup=main_keyboard(user_id), parse_mode="Markdown")
 
     except Exception as e:
         error_msg = str(e)
