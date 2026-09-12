@@ -21,7 +21,6 @@ from telegram.ext import (
 from google import genai
 
 # استخدام المكتبة الرسمية لـ cTrader Open API
-from ctrader_open_api import Client, Protobuf, TcpProtocol
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
 
 # =====================================================================
@@ -155,8 +154,8 @@ async def fetch_ctrader_data_for_timeframes(symbol: str, timeframes: List[str]) 
     market_data = {}
     
     # اختيار السيرفر Live أو Demo
-    host = Endpoints.PROTOBOL_HOST_LIVE
-    port = Endpoints.PROTOBOL_PORT
+    host = EndPoints.PROTOBUF_HOST_LIVE
+    port = EndPoints.PROTOBUF_PORT
     
     client = Client(host, port, TcpProtocol)
     
@@ -334,11 +333,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 7. التشغيل الرئيسي (Main Entry Point)
 # =====================================================================
 
+async def post_init(application):
+    """حذف الـ Webhook تلقائياً للتأكد من عمل Polling بشكل صحيح بدون تعارضات"""
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logging.info("تم مسح الـ Webhook القديم بنجاح بنسبة 100%.")
+
 def main():
     if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         raise ValueError("يرجى إدخال TELEGRAM_BOT_TOKEN في متغيرات البيئة!")
 
-    telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    telegram_app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
