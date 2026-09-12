@@ -9,9 +9,7 @@ from typing import List, Optional, Dict, Any, Set
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, status, HTTPException
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
 from google import genai
-from google.genai import types
 
 # مكتبات التلغرام
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,7 +30,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
@@ -42,10 +40,8 @@ WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrend
 WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# مفتاح Finnhub API
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "dae8079r01ql3jf9a350dae8079r01ql3jf9a35g")
 
-# إعدادات cTrader Open API
 CTRADER_HOST = os.getenv("CTRADER_HOST", "demo.ctraderapi.com")
 CTRADER_PORT = int(os.getenv("CTRADER_PORT", 5035))
 CLIENT_ID = os.getenv("CTRADER_CLIENT_ID")
@@ -57,15 +53,12 @@ telegram_app: Optional[Application] = None
 is_ctrader_connected = False
 stop_ctrader_flag = False
 
-# بيانات الحساب والصفقات المفتوحة
 ctrader_account_info: Dict[str, Any] = {"balance": 0.0, "equity": 0.0, "margin": 0.0, "free_margin": 0.0}
 active_positions: List[Dict[str, Any]] = []
 
-# ذاكرة ديناميكية لخريطة الأزواج وبيانات الشموع
 symbol_id_map: Dict[str, int] = {}
 trendbars_cache: Dict[str, Dict[str, Any]] = {}
 
-# الأطر الزمنية والأزواج المتاحة لكل فئة
 AVAILABLE_TIMEFRAMES = ["M15", "H1", "H4", "D1"]
 user_selected_tfs: Dict[int, List[str]] = {}
 
@@ -76,12 +69,9 @@ ALL_AVAILABLE_SYMBOLS = {
     "crypto": ["BTCUSD", "ETHUSD", "SOLUSD", "AAPL", "NVDA", "TSLA"]
 }
 
-user_selections: Dict[int, Dict[str, Set[str]]] = {}
-
 # ==================== Data Aggregation Layer ====================
 
 async def fetch_forex_factory_calendar() -> List[Dict[str, Any]]:
-    """سحب تقويم الأحداث الاقتصادية"""
     url = "https://nfp.ourforecast.com/api/v1/calendar"
     try:
         async with httpx.AsyncClient(timeout=5.0) as http_client:
@@ -93,7 +83,6 @@ async def fetch_forex_factory_calendar() -> List[Dict[str, Any]]:
     return []
 
 async def fetch_finnhub_news() -> List[str]:
-    """سحب الأخبار المالية الفورية من Finnhub API"""
     if not FINNHUB_API_KEY:
         return []
     url = f"https://finnhub.io/api/v1/news?category=forex&token={FINNHUB_API_KEY}"
@@ -108,7 +97,6 @@ async def fetch_finnhub_news() -> List[str]:
     return []
 
 async def fetch_tradingview_rss() -> List[str]:
-    """سحب RSS Feed الخاص بـ TradingView"""
     url = "https://www.tradingview.com/feed/"
     try:
         loop = asyncio.get_running_loop()
@@ -119,7 +107,6 @@ async def fetch_tradingview_rss() -> List[str]:
     return []
 
 async def aggregate_market_data(symbol: str) -> Dict[str, Any]:
-    """تجميع الأخبار والبيانات الحقيقية بالتوازي"""
     ff_task = fetch_forex_factory_calendar()
     fh_task = fetch_finnhub_news()
     tv_task = fetch_tradingview_rss()
@@ -154,7 +141,7 @@ def on_disconnected(client, reason):
     print(f"❌ Disconnected from cTrader Open API: {reason}")
 
 def on_message_received(client, message):
-    global symbol_id_map, trendbars_cache, ctrader_account_info
+    global symbol_id_map, trendbars_cache
     msg_type = message.payloadType
     
     if msg_type == ProtoOAApplicationAuthRes().payloadType:
@@ -176,14 +163,6 @@ def on_message_received(client, message):
         for s in res.symbol:
             symbol_id_map[s.symbolName] = s.symbolId
         print(f"📊 Loaded {len(symbol_id_map)} Symbol IDs from Broker.")
-
-    elif msg_type == ProtoOAGetTrendbarsRes().payloadType:
-        res = ProtoOAGetTrendbarsRes()
-        res.ParseFromString(message.payload)
-        if len(res.trendbar) > 0:
-            last_bar = res.trendbar[-1]
-            close_price = (last_bar.low + last_bar.deltaClose) / 100000.0
-            print(f"📈 Trendbar Received - Bars: {len(res.trendbar)}, Latest Close: {close_price}")
 
 def request_account_details():
     if is_ctrader_connected and ACCOUNT_ID:
@@ -262,10 +241,10 @@ async def generate_comprehensive_analysis(aggregated_data: Dict[str, Any], selec
     🔹 **الأطر الزمنية المستهدفة:** {', '.join(selected_tfs)}
 
     📊 **1. التحليل الأخباري والتأثير الاقتصادي:**
-    [صغ تحليلاً دقيقاً بناءً على أخبار Finnhub وتقويم Forex Factory]
+    [صغ تحليلاً دقيقاً بناءً على الأخبار والتقويم الاقتصادي]
 
     📈 **2. النظرة الفنية متعددة الفريمات:**
-    [حلل الاتجاه ومستويات السيولة والـ ATR المتوقعة بناءً على الفريمات المحددة]
+    [حلل الاتجاه ومستويات السيولة بناءً على الفريمات المحددة]
 
     ⚡ **3. التوصية التنفيذية:**
     • **نوع الخيار:** 🟢 شراء (BUY) / 🔴 بيع (SELL) / ⚪ محايد (NEUTRAL)
@@ -275,7 +254,7 @@ async def generate_comprehensive_analysis(aggregated_data: Dict[str, Any], selec
     • **نسبة المخاطرة إلى العائد:** [R:R Ratio]
 
     💡 **4. توصيات إدارة المخاطر:**
-    [نصيحة سريعة لإدارة رأس المال]
+    [نصيحة لإدارة رأس المال]
     """
 
     try:
@@ -287,7 +266,7 @@ async def generate_comprehensive_analysis(aggregated_data: Dict[str, Any], selec
     except Exception as e:
         return f"❌ **خطأ أثناء توليد التحليل عبر الذكاء الاصطناعي:**\n`{str(e)}`"
 
-# ==================== لوحات التحكم والأزرار الكاملة ====================
+# ==================== لوحات التحكم والأزرار المصلحة ====================
 
 def is_authorized(update: Update) -> bool:
     if not MY_TELEGRAM_CHAT_ID:
@@ -298,15 +277,12 @@ def is_authorized(update: Update) -> bool:
 def main_keyboard():
     keyboard = [
         [
-            InlineKeyboardButton("💱 توصيات الفوركس", callback_data="sig_forex"),
-            InlineKeyboardButton("🥇 المعادن والطاقة", callback_data="sig_commodities")
+            InlineKeyboardButton("💱 توصيات الفوركس", callback_data="category_forex"),
+            InlineKeyboardButton("🥇 المعادن والطاقة", callback_data="category_commodities")
         ],
         [
-            InlineKeyboardButton("📈 توصيات المؤشرات", callback_data="sig_indices"),
-            InlineKeyboardButton("₿ الأسهم والعملات", callback_data="sig_crypto")
-        ],
-        [
-            InlineKeyboardButton("⚙️ تعديل قائمة الأزواج المتاحة", callback_data="manage_categories")
+            InlineKeyboardButton("📈 توصيات المؤشرات", callback_data="category_indices"),
+            InlineKeyboardButton("₿ الأسهم والعملات", callback_data="category_crypto")
         ],
         [
             InlineKeyboardButton("📊 حالة النظام", callback_data="btn_status"),
@@ -315,22 +291,6 @@ def main_keyboard():
         [
             InlineKeyboardButton("📈 الصفقات المفتوحة", callback_data="btn_positions"),
             InlineKeyboardButton("🔄 تحديث البيانات", callback_data="btn_refresh")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def category_selection_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("💱 أزواج الفوركس", callback_data="editcat_forex"),
-            InlineKeyboardButton("🥇 المعادن والطاقة", callback_data="editcat_commodities")
-        ],
-        [
-            InlineKeyboardButton("📈 المؤشرات العالمية", callback_data="editcat_indices"),
-            InlineKeyboardButton("₿ الأسهم والعملات الرقمية", callback_data="editcat_crypto")
-        ],
-        [
-            InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_main")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -356,14 +316,14 @@ def tf_selection_keyboard(user_id: int, symbol: str):
     
     for tf in AVAILABLE_TIMEFRAMES:
         icon = "☑️" if tf in selected else "🔲"
-        row.append(InlineKeyboardButton(f"{icon} {tf}", callback_data=f"tf_toggle_{tf}_{symbol}"))
+        row.append(InlineKeyboardButton(f"{icon} {tf}", callback_data=f"tftoggle_{tf}_{symbol}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
 
-    keyboard.append([InlineKeyboardButton("🚀 ابدأ التحليل الشامل", callback_data=f"run_analysis_{symbol}")])
+    keyboard.append([InlineKeyboardButton("🚀 ابدأ التحليل الشامل", callback_data=f"runanalysis_{symbol}")])
     keyboard.append([InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_main")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -393,41 +353,42 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "back_main":
         await query.edit_message_text(
-            "🤖 **مرحباً بك في لوحة التحليل والتداول التفاعلية!**\n\n"
-            "اختر خياراً من القائمة أدناه:",
+            "🤖 **القائمة الرئيسية:**\n\nاختر خياراً من القائمة أدناه:",
             reply_markup=main_keyboard(),
             parse_mode="Markdown"
         )
 
-    # 1. أزرار اختيار الفئات
-    elif data in ["sig_forex", "sig_commodities", "sig_indices", "sig_crypto"]:
-        cat_map = {"sig_forex": "forex", "sig_commodities": "commodities", "sig_indices": "indices", "sig_crypto": "crypto"}
-        cat_name = cat_map[data]
+    # 1. عرض أزواج الفئة المحددة
+    elif data.startswith("category_"):
+        cat_name = data.replace("category_", "")
         await query.edit_message_text(
-            f"📋 **اختر الزوج المطلوب لتحليله ضمن فئة [{cat_name.upper()}]:**",
+            f"📋 **اختر الزوج/الأصل المراد تحليله [{cat_name.upper()}]:**",
             reply_markup=symbol_picker_keyboard(cat_name),
             parse_mode="Markdown"
         )
 
-    # 2. اختيار الزوج وضبط الفريمات
+    # 2. اختيار الزوج والانتقال لتحديد الأطر الزمنية
     elif data.startswith("selectsym_"):
-        symbol = data.split("_")[1]
+        symbol = data.replace("selectsym_", "")
         if user_id not in user_selected_tfs:
             user_selected_tfs[user_id] = ["H1"]
         
         request_symbol_trendbars(symbol, "H1")
         
         await query.edit_message_text(
-            f"⚙️ **إدارة الأطر الزمنية لـ [{symbol}]**\n\n"
-            f"حدد الفريمات المطلوبة ثم انقر على **ابدأ التحليل الشامل**:",
+            f"⚙️ **الأطر الزمنية المستهدفة لـ [{symbol}]**\n\n"
+            f"حدد الفريمات المناسبة ثم اضغط **ابدأ التحليل الشامل**:",
             reply_markup=tf_selection_keyboard(user_id, symbol),
             parse_mode="Markdown"
         )
 
-    elif data.startswith("tf_toggle_"):
-        _, _, tf, symbol = data.split("_")
-        current_tfs = user_selected_tfs.get(user_id, ["H1"])
+    # 3. تبديل تحديد الفريمات (Toggle)
+    elif data.startswith("tftoggle_"):
+        parts = data.split("_")
+        tf = parts[1]
+        symbol = parts[2]
         
+        current_tfs = user_selected_tfs.get(user_id, ["H1"])
         if tf in current_tfs:
             if len(current_tfs) > 1:
                 current_tfs.remove(tf)
@@ -437,15 +398,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         user_selected_tfs[user_id] = current_tfs
         await query.edit_message_reply_markup(reply_markup=tf_selection_keyboard(user_id, symbol))
 
-    # 3. تشغيل التحليل
-    elif data.startswith("run_analysis_"):
-        symbol = data.split("_")[2]
+    # 4. تشغيل التحليل
+    elif data.startswith("runanalysis_"):
+        symbol = data.replace("runanalysis_", "")
         selected_tfs = user_selected_tfs.get(user_id, ["H1"])
 
         await query.edit_message_text(
-            f"⏳ **جاري تجميع البيانات لـ [{symbol}]...**\n"
-            f"• Finnhub News ✅\n• Forex Factory Calendar ✅\n• cTrader Open API ✅\n\n"
-            f"🧠 **جاري المعالجة عبر الذكاء الاصطناعي...**",
+            f"⏳ **جاري سحب البيانات لـ [{symbol}]...**\n"
+            f"• Finnhub API ✅\n"
+            f"• Forex Factory Calendar ✅\n"
+            f"• cTrader Open API ✅\n\n"
+            f"🧠 **جاري تحليل البيانات عبر {GEMINI_MODEL}...**",
             parse_mode="Markdown"
         )
 
@@ -453,15 +416,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         report = await generate_comprehensive_analysis(aggregated, selected_tfs)
         await query.message.reply_text(report, reply_markup=main_keyboard(), parse_mode="Markdown")
 
-    # 4. حالة النظام والمطلوبات الأخرى
-    elif data == "manage_categories":
-        await query.edit_message_text(
-            "⚙️ **تعديل قائمة الأزواج المتاحة**\n\n"
-            "الرجاء اختيار الفئة التي تريد إدارة أزواجها:",
-            reply_markup=category_selection_keyboard(),
-            parse_mode="Markdown"
-        )
-
+    # 5. معلومات النظام والحساب
     elif data == "btn_status":
         ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
         status_msg = (
