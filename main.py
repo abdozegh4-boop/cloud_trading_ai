@@ -33,7 +33,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 load_dotenv()
 
 # ==================== المتغيرات البيئية ====================
-GEMINI_MODEL = "gemini-3.6-flash"  # غيّره إلى النموذج المتاح لديك
+GEMINI_MODEL = "gemini-2.0-flash"  # غيّره حسب النموذج المتاح لديك
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
@@ -312,7 +312,7 @@ def build_symbols_checkbox_keyboard(category: str, selected_symbols: set):
         is_checked = symbol in selected_symbols
         icon = "☑️" if is_checked else "🔲"
         btn_text = f"{icon} {symbol}"
-        # استخدام | لتجنب مشاكل الـ split
+        # استخدام | بدلاً من _ لتجنب مشاكل التقسيم
         callback_data = f"toggle|{category}|{symbol}"
         
         row.append(InlineKeyboardButton(btn_text, callback_data=callback_data))
@@ -418,6 +418,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         if user_id not in user_selections:
             user_selections[user_id] = {}
+        # نستخدم .copy() لتجنب تعديل المرجع الأصلي
         user_selections[user_id][category] = current_db_symbols.copy()
 
         kb = build_symbols_checkbox_keyboard(category, current_db_symbols)
@@ -452,7 +453,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         kb = build_symbols_checkbox_keyboard(category, selected_set)
         await query.edit_message_reply_markup(reply_markup=kb)
 
-    # ---------- حفظ التغييرات (مع حماية) ----------
+    # ---------- حفظ التغييرات (مع حماية كاملة) ----------
     elif data.startswith("save|"):
         category = data.split("|", 1)[1]
 
@@ -486,7 +487,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
-    # ---------- إشارات التحليل ----------
+    # ---------- إشارات التحليل (مع فحص القائمة الفارغة) ----------
     elif data == "sig_forex":
         symbols = get_broker_symbols_by_category("forex", ["EURUSD", "GBPUSD", "USDJPY"])
         if not symbols:
