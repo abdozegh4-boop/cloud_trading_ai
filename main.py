@@ -19,6 +19,7 @@ import db  # طبقة التخزين الدائم على Neon (PostgreSQL) + ا�
 
 # مكتبات التلغرام
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -534,6 +535,27 @@ async def scheduled_analysis_job():
 
 # ==================== لوحات التحكم والأزرار ====================
 
+async def safe_send_message(bot, chat_id: int, text: str, reply_markup=None):
+    """
+    يحاول إرسال الرسالة بتنسيق Markdown أولاً. نصوص Gemini المولَّدة تلقائياً
+    قد تحتوي أحياناً على رمز * أو _ أو ` غير متوازن (مثلاً "50% من *الشراء" بدون
+    إغلاق)، وهذا يجعل تلغرام يرفض الرسالة كاملة بخطأ:
+    "Can't parse entities: can't find end of the entity starting at byte offset X".
+    لتفادي فقدان الرسالة بالكامل، إن فشل التحليل نعيد الإرسال كنص عادي بدون تنسيق.
+    """
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    except BadRequest as e:
+        if "can't parse entities" in str(e).lower():
+            logger.warning(f"⚠️ فشل تحليل Markdown، إعادة الإرسال كنص عادي: {e}")
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            except Exception as e2:
+                logger.error(f"❌ فشل الإرسال حتى كنص عادي: {e2}")
+        else:
+            raise
+
+
 def is_authorized(update: Update) -> bool:
     if not MY_TELEGRAM_CHAT_ID:
         return True
@@ -778,12 +800,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 report_lines.append("")
 
             final_report = "\n".join(report_lines)
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=final_report,
-                reply_markup=main_keyboard(user_id),
-                parse_mode="Markdown"
-            )
+            await safe_send_message(context.bot, user_id, final_report, reply_markup=main_keyboard(user_id))
 
         elif data in ["analyze_forexfactory", "analyze_finnhub", "analyze_tradingview", "run_full_analysis"]:
             selected_syms = user_selected_symbols.get(user_id, [])
@@ -816,20 +833,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
             try:
                 report = await get_or_generate_report(internal_type, selected_syms, selected_tfs)
-
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=report,
-                    reply_markup=main_keyboard(user_id),
-                    parse_mode="Markdown"
-                )
+                await safe_send_message(context.bot, user_id, report, reply_markup=main_keyboard(user_id))
             except Exception as ai_err:
                 logger.error(f"Analysis Execution Error: {ai_err}")
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"⚠️ **حدث خطأ أثناء إجراء التحليل:**\n`{str(ai_err)}`",
-                    reply_markup=main_keyboard(user_id),
-                    parse_mode="Markdown"
+                    text=f"⚠️ حدث خطأ أثناء إجراء التحليل:\n{str(ai_err)}",
+                    reply_markup=main_keyboard(user_id)
                 )
 
         elif data == "btn_status":
