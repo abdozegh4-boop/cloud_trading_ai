@@ -45,7 +45,7 @@ WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrend
 WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "dae8079r01ql3jf9a350dae8079r01ql3jf9a35g")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 # إعدادات cTrader
 CTRADER_HOST = os.getenv("CTRADER_HOST", "demo.ctraderapi.com")
@@ -85,7 +85,7 @@ ALL_AVAILABLE_SYMBOLS = {
 async def fetch_forex_factory_calendar() -> List[Dict[str, Any]]:
     url = "https://nfp.ourforecast.com/api/v1/calendar"
     try:
-        async with httpx.AsyncClient(timeout=3.0) as http_client:
+        async with httpx.AsyncClient(timeout=4.0) as http_client:
             resp = await http_client.get(url)
             if resp.status_code == 200:
                 return resp.json()[:5]
@@ -98,7 +98,7 @@ async def fetch_finnhub_news() -> List[str]:
         return []
     url = f"https://finnhub.io/api/v1/news?category=forex&token={FINNHUB_API_KEY}"
     try:
-        async with httpx.AsyncClient(timeout=3.0) as http_client:
+        async with httpx.AsyncClient(timeout=4.0) as http_client:
             resp = await http_client.get(url)
             if resp.status_code == 200:
                 articles = resp.json()[:5]
@@ -238,7 +238,7 @@ def ctrader_auto_reconnect_loop():
 
 async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, Any], selected_tfs: List[str]) -> str:
     if not ai_client:
-        return "❌ **خطأ:** مفتاح Google Gemini API غير متوفر."
+        return "❌ **خطأ:** مفتاح Google Gemini API غير متوفر في متغيرات البيئة."
 
     symbols_list_str = ", ".join(aggregated_data['symbols'])
     tfs_list_str = ", ".join(selected_tfs)
@@ -425,6 +425,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
+    # الرد المباشر لإنهاء حالة التحميل على زر التلغرام
     try:
         await query.answer()
     except Exception as e:
@@ -459,25 +460,31 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
         elif data.startswith("category_"):
-            category = data.split("_")[1]
-            await query.edit_message_text(
-                f"📋 **اختر الأزواج المطلوبة ضمن فئة [{category.upper()}]:**",
-                reply_markup=symbol_picker_keyboard(user_id, category),
-                parse_mode="Markdown"
-            )
+            parts = data.split("_", 1)
+            if len(parts) == 2:
+                category = parts[1]
+                await query.edit_message_text(
+                    f"📋 **اختر الأزواج المطلوبة ضمن فئة [{category.upper()}]:**",
+                    reply_markup=symbol_picker_keyboard(user_id, category),
+                    parse_mode="Markdown"
+                )
 
         elif data.startswith("toggle_sym_"):
-            _, _, sym, category = data.split("_")
-            current_syms = user_selected_symbols.get(user_id, [])
-            
-            if sym in current_syms:
-                current_syms.remove(sym)
-            else:
-                current_syms.append(sym)
-                request_symbol_trendbars(sym, "H1")
+            # المعالجة الآمنة لتقسيم callback_data
+            parts = data.split("_")
+            if len(parts) >= 4:
+                sym = parts[2]
+                category = parts[3]
+                current_syms = user_selected_symbols.get(user_id, [])
+                
+                if sym in current_syms:
+                    current_syms.remove(sym)
+                else:
+                    current_syms.append(sym)
+                    request_symbol_trendbars(sym, "H1")
 
-            user_selected_symbols[user_id] = current_syms
-            await query.edit_message_reply_markup(reply_markup=symbol_picker_keyboard(user_id, category))
+                user_selected_symbols[user_id] = current_syms
+                await query.edit_message_reply_markup(reply_markup=symbol_picker_keyboard(user_id, category))
 
         elif data == "open_timeframes_menu":
             await query.edit_message_text(
@@ -487,17 +494,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
         elif data.startswith("toggle_tf_"):
-            tf = data.split("_")[2]
-            current_tfs = user_selected_tfs.get(user_id, ["H1"])
-            
-            if tf in current_tfs:
-                if len(current_tfs) > 1:
-                    current_tfs.remove(tf)
-            else:
-                current_tfs.append(tf)
+            parts = data.split("_")
+            if len(parts) >= 3:
+                tf = parts[2]
+                current_tfs = user_selected_tfs.get(user_id, ["H1"])
                 
-            user_selected_tfs[user_id] = current_tfs
-            await query.edit_message_reply_markup(reply_markup=shared_tf_keyboard(user_id))
+                if tf in current_tfs:
+                    if len(current_tfs) > 1:
+                        current_tfs.remove(tf)
+                else:
+                    current_tfs.append(tf)
+                    
+                user_selected_tfs[user_id] = current_tfs
+                await query.edit_message_reply_markup(reply_markup=shared_tf_keyboard(user_id))
 
         # أزرار التحليل المخصصة
         elif data in ["analyze_forexfactory", "analyze_finnhub", "analyze_tradingview", "run_full_analysis"]:
