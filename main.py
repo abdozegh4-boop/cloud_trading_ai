@@ -36,14 +36,14 @@ logger = logging.getLogger("TradingBot")
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MY_TELEGRAM_CHAT_ID = os.getenv("MY_TELEGRAM_CHAT_ID")
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://cloud-trading-ai.onrender.com")
-WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}"
+WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else "/telegram/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
@@ -253,7 +253,6 @@ def on_message_received(client, message):
         res = ProtoOAGetTrendbarsRes()
         res.ParseFromString(message.payload)
         
-        # ربط الشموع بالزوج والإطار الزمني في الكاش
         sym_name = symbol_id_to_name.get(res.symbolId, "UNKNOWN")
         tf = pending_requests_tf.get(res.symbolId, "H1")
         
@@ -272,7 +271,6 @@ def on_message_received(client, message):
             ctrader_account_info["balance"] = res.account.balance / 100.0
             ctrader_account_info["equity"] = res.account.balance / 100.0
         
-        # تفريغ وتحديث قائمة الصفقات المفتوحة
         active_positions.clear()
         for pos in res.position:
             sym_name = symbol_id_to_name.get(pos.tradeData.symbolId, f"ID_{pos.tradeData.symbolId}")
@@ -299,7 +297,6 @@ def request_symbol_trendbars(symbol_name: str, timeframe: str = "H1"):
     symbol_id = symbol_id_map[symbol_name]
     pending_requests_tf[symbol_id] = timeframe
     
-    # استخدام ProtoOATrendbarPeriod الصحيح
     period_map = {
         "M15": ProtoOATrendbarPeriod.M15,
         "H1": ProtoOATrendbarPeriod.H1,
@@ -311,7 +308,7 @@ def request_symbol_trendbars(symbol_name: str, timeframe: str = "H1"):
     req.ctidTraderAccountId = ACCOUNT_ID
     req.symbolId = symbol_id
     req.period = period_map.get(timeframe, ProtoOATrendbarPeriod.H1)
-    req.fromTimestamp = int((time.time() - 86400 * 30) * 1000) # جلب 30 يوماً لحساب المؤشرات بدقة
+    req.fromTimestamp = int((time.time() - 86400 * 30) * 1000)
     req.toTimestamp = int(time.time() * 1000)
     
     ctrader_client.send(req)
@@ -595,7 +592,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     current_syms.remove(sym)
                 else:
                     current_syms.append(sym)
-                    # طلب الشموع للأطر المختارة فوراً عند اختيار الزوج
                     for tf in user_selected_tfs.get(user_id, ["H1"]):
                         request_symbol_trendbars(sym, tf)
 
@@ -620,14 +616,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         current_tfs.remove(tf)
                 else:
                     current_tfs.append(tf)
-                    # طلب الشموع للأزواج المختارة عند اختيار إطار جديد
                     for sym in user_selected_symbols.get(user_id, []):
                         request_symbol_trendbars(sym, tf)
                     
                 user_selected_tfs[user_id] = current_tfs
                 await query.edit_message_reply_markup(reply_markup=shared_tf_keyboard(user_id))
 
-        # معالجة زر المؤشرات الفنية الرقمية المباشرة
         elif data == "calc_indicators":
             selected_syms = user_selected_symbols.get(user_id, [])
             selected_tfs = user_selected_tfs.get(user_id, ["H1"])
@@ -680,7 +674,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
-        # أزرار التحليل المخصصة عبر الذكاء الاصطناعي
         elif data in ["analyze_forexfactory", "analyze_finnhub", "analyze_tradingview", "run_full_analysis"]:
             selected_syms = user_selected_symbols.get(user_id, [])
             selected_tfs = user_selected_tfs.get(user_id, ["H1"])
@@ -773,7 +766,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif data == "btn_refresh":
             request_account_details()
-            # تحديث الشموع للأزواج الحالية
             for sym in user_selected_symbols.get(user_id, []):
                 for tf in user_selected_tfs.get(user_id, ["H1"]):
                     request_symbol_trendbars(sym, tf)
@@ -793,85 +785,68 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
-# ==================== Service Keep-Alive ====================
-
-async def keep_alive():
-    await asyncio.sleep(10)
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    async with httpx.AsyncClient(limits=limits, timeout=10.0) as client_http:
-        while True:
-            try:
-                res = await client_http.get(WEBHOOK_HOST)
-                if res.status_code == 200:
-                    logger.info("Keep-Alive Self-Ping Successful")
-            except Exception as e:
-                logger.error(f"Keep-Alive Error: {e}")
-            await asyncio.sleep(480)
-
-# ==================== FastAPI Server & Lifecycle ====================
+# ==================== FastAPI Web Server & Webhook Config ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global telegram_app, stop_ctrader_flag
     
-    ping_task = asyncio.create_task(keep_alive())
-
+    # تشغيل خيط إعادة الاتصال الخاص بـ cTrader
     stop_ctrader_flag = False
-    if CLIENT_ID and CLIENT_SECRET:
-        threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True).start()
+    threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True).start()
 
+    # تهيئة تطبيق تلغرام
     if TELEGRAM_BOT_TOKEN:
+        telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        telegram_app.add_handler(CommandHandler("start", cmd_start))
+        telegram_app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+        await telegram_app.initialize()
+        await telegram_app.start()
+
+        # إعداد الـ Webhook الخاص بالتلغرام
         try:
-            telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-            telegram_app.add_handler(CommandHandler("start", cmd_start))
-            telegram_app.add_handler(CallbackQueryHandler(handle_callback_query))
-
-            await telegram_app.initialize()
-            await telegram_app.start()
-
-            await telegram_app.bot.set_webhook(
-                url=WEBHOOK_URL,
-                drop_pending_updates=True,
-                max_connections=40
-            )
-            logger.info(f"Telegram Webhook active on {WEBHOOK_URL}")
+            await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
+            logger.info(f"Telegram Webhook set to: {WEBHOOK_URL}")
         except Exception as e:
-            logger.error(f"Telegram App Init Error: {e}")
+            logger.error(f"Failed to set Telegram Webhook: {e}")
 
     yield
 
+    # إيقاف التلغرام و cTrader عند إيقاف الخادم
     stop_ctrader_flag = True
-    ping_task.cancel()
     if telegram_app:
-        await telegram_app.bot.delete_webhook()
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+        try:
+            await telegram_app.stop()
+            await telegram_app.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down Telegram App: {e}")
 
-app = FastAPI(title="Cloud Trading AI Engine", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "AI Trading Assistant",
+        "ctrader_connected": is_ctrader_connected
+    }
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
+async def process_telegram_webhook(request: Request):
     if not telegram_app:
-        raise HTTPException(status_code=500, detail="Telegram bot not ready")
+        raise HTTPException(status_code=500, detail="Telegram app not initialized")
+    
     try:
         data = await request.json()
         update = Update.de_json(data, telegram_app.bot)
         await telegram_app.process_update(update)
         return Response(status_code=status.HTTP_200_OK)
     except Exception as e:
-        logger.error(f"Webhook Exception: {e}")
+        logger.error(f"Error processing webhook update: {e}")
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-@app.get("/")
-@app.head("/")
-def read_root():
-    return {
-        "status": "online",
-        "model": GEMINI_MODEL,
-        "ctrader_connected": is_ctrader_connected
-    }
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
