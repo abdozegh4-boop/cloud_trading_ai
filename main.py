@@ -7,11 +7,15 @@ import logging
 import math
 import httpx
 import feedparser
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Set
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, status, HTTPException
 from contextlib import asynccontextmanager
 from google import genai
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+import db  # طبقة التخزين الدائم على Neon (PostgreSQL) + الذاكرة التاريخية
 
 # مكتبات التلغرام
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,7 +41,7 @@ logger = logging.getLogger("TradingBot")
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
@@ -58,6 +62,7 @@ ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN")
 ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", 0)) if os.getenv("CTRADER_ACCOUNT_ID") else 0
 
 telegram_app: Optional[Application] = None
+scheduler: Optional[AsyncIOScheduler] = None
 is_ctrader_connected = False
 stop_ctrader_flag = False
 
@@ -314,6 +319,19 @@ def request_symbol_trendbars(symbol_name: str, timeframe: str = "H1"):
     
     ctrader_client.send(req)
 
+async def ensure_trendbars_ready(symbol: str, tf: str, wait_seconds: float = 4.0) -> List[Any]:
+    """
+    يرجع الشموع المخزّنة محلياً لهذا الزوج/الإطار؛ وإن لم تكن متوفرة بعد،
+    يطلبها من cTrader وينتظر قليلاً قبل إعادة المحاولة (تُستخدم من المهمة المجدولة).
+    """
+    bars = trendbars_cache.get(symbol, {}).get(tf, [])
+    if not bars:
+        request_symbol_trendbars(symbol, tf)
+        await asyncio.sleep(wait_seconds)
+        bars = trendbars_cache.get(symbol, {}).get(tf, [])
+    return bars
+
+
 ctrader_client.setConnectedCallback(on_connected)
 ctrader_client.setDisconnectedCallback(on_disconnected)
 ctrader_client.setMessageReceivedCallback(on_message_received)
@@ -343,12 +361,23 @@ def ctrader_auto_reconnect_loop():
 
 # ==================== AI Specific Analysis Prompts ====================
 
-async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, Any], selected_tfs: List[str]) -> str:
+async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, Any], selected_tfs: List[str],
+                                 history_text: str = "") -> str:
     if not ai_client:
         return "❌ **خطأ:** مفتاح Google Gemini API غير متوفر في متغيرات البيئة."
 
     symbols_list_str = ", ".join(aggregated_data['symbols'])
     tfs_list_str = ", ".join(selected_tfs)
+
+    memory_block = (
+        f"""
+        --- الذاكرة التاريخية (تحاليل سابقة لنفس الأزواج والأطر، الأقدم أولاً) ---
+        {history_text}
+        ملاحظة: قارن قراءتك الحالية بهذه التحاليل السابقة إن وُجدت، ونوّه صراحة إلى
+        أي تغيّر في الاتجاه أو التوصية أو استمرارية السيناريو السابق.
+        """
+        if history_text else ""
+    )
 
     if analysis_type == "forex_factory":
         prompt = f"""
@@ -357,7 +386,7 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
 
         Forex Factory Data:
         {json.dumps(aggregated_data['forex_factory'], indent=2)}
-
+        {memory_block}
         Provide a detailed Economic Calendar Analysis in Arabic covering:
         1. Upcoming high-impact economic releases affecting [{symbols_list_str}].
         2. Expected volatility levels during these news events.
@@ -371,7 +400,7 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
 
         Finnhub News Data:
         {chr(10).join(aggregated_data['finnhub_news']) if aggregated_data['finnhub_news'] else 'No news items available.'}
-
+        {memory_block}
         Provide a Breaking News Analysis in Arabic covering:
         1. Key market headlines impacting [{symbols_list_str}].
         2. Short-term sentiment analysis (Bullish / Bearish sentiment score).
@@ -385,7 +414,7 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
 
         TradingView Feed:
         {chr(10).join(aggregated_data['tradingview_rss']) if aggregated_data['tradingview_rss'] else 'No RSS items available.'}
-
+        {memory_block}
         Provide a Technical Overview in Arabic covering:
         1. Multi-timeframe trend outlook on [{tfs_list_str}] for each symbol in [{symbols_list_str}].
         2. Major support and resistance zones identified.
@@ -401,7 +430,7 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
         Calendar: {json.dumps(aggregated_data['forex_factory'], indent=2)}
         News: {chr(10).join(aggregated_data['finnhub_news'])}
         TradingView: {chr(10).join(aggregated_data['tradingview_rss'])}
-
+        {memory_block}
         Provide a complete execution report in Arabic for EVERY symbol in [{symbols_list_str}]:
         • Symbol Name & Timeframes
         • Integrated Fundamental & Technical Assessment
@@ -422,6 +451,86 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
     except Exception as e:
         logger.error(f"Gemini Analysis Error: {e}")
         return f"❌ **خطأ أثناء توليد التحليل عبر الذكاء الاصطناعي:**\n`{str(e)}`"
+
+async def build_history_text(analysis_type: str, symbols: List[str], tfs: List[str]) -> str:
+    """يجلب آخر 3 تحاليل سابقة لنفس التركيبة من Neon ليُمرَّرا كـ'ذاكرة' إلى الذكاء الاصطناعي."""
+    history = await db.get_report_history(analysis_type, symbols, tfs, limit=3)
+    if not history:
+        return ""
+    lines = []
+    for h in reversed(history):  # الأقدم أولاً حتى يقرأها النموذج بترتيب زمني منطقي
+        ts = h["created_at"].strftime("%Y-%m-%d %H:%M UTC")
+        snippet = h["report_text"][:600]
+        lines.append(f"[{ts}]\n{snippet}\n")
+    return "\n".join(lines)
+
+
+async def get_or_generate_report(analysis_type: str, symbols: List[str], tfs: List[str]) -> str:
+    """
+    الكاش الذكي: يحاول أولاً قراءة آخر تحليل مخزّن في Neon.
+    - إن كان عمره أقل من فترة التحديث التلقائي (AUTO_ANALYSIS_INTERVAL_MINUTES) → يُعاد فوراً "من الذاكرة"
+      دون أي استدعاء جديد لـ Gemini (يوفّر الوقت والتكلفة).
+    - إن لم يوجد تحليل كافٍ الحداثة → يُولَّد تحليل جديد الآن، يُخزَّن، وتُسجَّل هذه التركيبة
+      كـ'متابعة نشطة' لتُحدَّث تلقائياً من الآن فصاعداً كل AUTO_ANALYSIS_INTERVAL_MINUTES دقيقة
+      عبر المهمة المجدولة scheduled_analysis_job، دون تدخل أي مستخدم.
+    """
+    cached = await db.get_latest_report(analysis_type, symbols, tfs)
+    max_age = timedelta(minutes=db.AUTO_ANALYSIS_INTERVAL_MINUTES)
+
+    if cached and (datetime.now(timezone.utc) - cached["created_at"]) < max_age:
+        age_min = int((datetime.now(timezone.utc) - cached["created_at"]).total_seconds() // 60)
+        return f"🗄️ *(من الذاكرة المخزّنة — آخر تحديث قبل {age_min} دقيقة)*\n\n{cached['report_text']}"
+
+    aggregated = await aggregate_multi_symbols_data(symbols)
+    history_text = await build_history_text(analysis_type, symbols, tfs)
+    report = await run_specific_analysis(analysis_type, aggregated, tfs, history_text)
+
+    await db.save_report(analysis_type, symbols, tfs, report, raw_data=aggregated)
+    await db.register_active_watch(analysis_type, symbols, tfs)
+
+    prefix = f"🆕 *(تحليل جديد الآن — تم تسجيله للتحديث التلقائي كل {db.AUTO_ANALYSIS_INTERVAL_MINUTES} دقيقة)*\n\n"
+    return prefix + report
+
+
+async def scheduled_analysis_job():
+    """
+    مهمة تعمل تلقائياً كل AUTO_ANALYSIS_INTERVAL_MINUTES دقيقة (مجدولة عبر APScheduler):
+    1) تحدّث المؤشرات الفنية لكل الأزواج/الأطر التابعة للمتابعات النشطة وتخزّنها في Neon.
+    2) تعيد توليد كل تحليل AI مسجَّل في active_watches باستخدام أحدث بيانات + الذاكرة التاريخية،
+       بحيث يجد المستخدم عند الضغط على أي زر تحليلاً جاهزاً "من الذاكرة" فوراً دون انتظار.
+    """
+    if not db.pool:
+        return
+    logger.info("⏰ بدء دورة التحليل التلقائي المجدولة...")
+    due = await db.get_due_watches(db.AUTO_ANALYSIS_INTERVAL_MINUTES)
+
+    for watch in due:
+        analysis_type = watch["analysis_type"]
+        symbols = [s for s in watch["symbols"].split(",") if s]
+        tfs = [t for t in watch["timeframes"].split(",") if t]
+        if not symbols or not tfs:
+            continue
+
+        try:
+            # 1) تحديث المؤشرات الفنية لكل زوج/إطار قبل التحليل (تُستخدم أيضاً كسجل تاريخي مستقل)
+            for sym in symbols:
+                for tf in tfs:
+                    bars = await ensure_trendbars_ready(sym, tf)
+                    if bars:
+                        indicators = calculate_technical_indicators(bars)
+                        await db.save_technical_snapshot(sym, tf, indicators)
+
+            # 2) توليد التحليل الجديد مع تمرير الذاكرة التاريخية للمقارنة
+            aggregated = await aggregate_multi_symbols_data(symbols)
+            history_text = await build_history_text(analysis_type, symbols, tfs)
+            report = await run_specific_analysis(analysis_type, aggregated, tfs, history_text)
+
+            await db.save_report(analysis_type, symbols, tfs, report, raw_data=aggregated)
+            await db.mark_watch_run(analysis_type, symbols, tfs)
+
+            logger.info(f"✅ تحديث تلقائي مكتمل: [{analysis_type}] {symbols} / {tfs}")
+        except Exception as e:
+            logger.error(f"❌ خطأ أثناء التحديث التلقائي لـ {analysis_type}/{symbols}/{tfs}: {e}")
 
 # ==================== لوحات التحكم والأزرار ====================
 
@@ -657,6 +766,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     if "error" in indicators:
                         report_lines.append(f"  • **الإطار [{tf}]:** ⚠️ `{indicators['error']}`")
                     else:
+                        await db.save_technical_snapshot(sym, tf, indicators)
                         report_lines.append(
                             f"  ⏱️ **إطار [{tf}]:**\n"
                             f"     • **السعر الحالي:** `{indicators['last_price']}`\n"
@@ -697,17 +807,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             label_name, internal_type = type_labels[data]
 
             await query.edit_message_text(
-                f"⏳ **جاري جلب معطيات [{label_name}]...**\n"
+                f"⏳ **جاري التحقق من الذاكرة المخزّنة لـ [{label_name}]...**\n"
                 f"• **الأزواج:** `{', '.join(selected_syms)}`\n"
                 f"• **الأطر الزمنية:** `{', '.join(selected_tfs)}`\n\n"
-                f"🧠 **جاري تحليل البيانات عبر Gemini AI...**",
+                f"🧠 **إن لم يوجد تحليل حديث كافٍ سيتم توليد واحد جديد عبر Gemini AI...**",
                 parse_mode="Markdown"
             )
 
             try:
-                aggregated = await aggregate_multi_symbols_data(selected_syms)
-                report = await run_specific_analysis(internal_type, aggregated, selected_tfs)
-                
+                report = await get_or_generate_report(internal_type, selected_syms, selected_tfs)
+
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=report,
@@ -725,9 +834,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif data == "btn_status":
             ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
+            db_status = "🟢 متصلة" if db.pool else "🔴 غير متصلة (تحقق من DATABASE_URL)"
             status_msg = (
                 f"🖥 **حالة الخادم:** 🟢 يعمل بنجاح\n"
                 f"🔌 **شبكة cTrader API:** {ctrader_status}\n"
+                f"🗄️ **قاعدة بيانات Neon:** {db_status}\n"
+                f"⏱️ **دورة التحديث التلقائي:** كل `{db.AUTO_ANALYSIS_INTERVAL_MINUTES}` دقيقة\n"
                 f"🧠 **النموذج النشط:** `{GEMINI_MODEL}`"
             )
             await query.edit_message_text(status_msg, reply_markup=main_keyboard(user_id), parse_mode="Markdown")
@@ -790,8 +902,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_app, stop_ctrader_flag
-    
+    global telegram_app, stop_ctrader_flag, scheduler
+
+    # تهيئة قاعدة بيانات Neon (Connection Pool + إنشاء الجداول إن لم تكن موجودة)
+    await db.init_db()
+
     # تشغيل خيط إعادة الاتصال الخاص بـ cTrader
     stop_ctrader_flag = False
     threading.Thread(target=ctrader_auto_reconnect_loop, daemon=True).start()
@@ -812,16 +927,34 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to set Telegram Webhook: {e}")
 
+    # بدء الجدولة التلقائية لتحديث كل التحاليل "النشطة" دورياً (فقط إن كانت Neon متصلة)
+    if db.pool:
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        scheduler.add_job(
+            scheduled_analysis_job,
+            "interval",
+            minutes=db.AUTO_ANALYSIS_INTERVAL_MINUTES,
+            id="auto_analysis_job",
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),  # أول تشغيل بعد 30 ثانية من الإقلاع
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        logger.info(f"🕒 تم جدولة التحليل التلقائي كل {db.AUTO_ANALYSIS_INTERVAL_MINUTES} دقيقة.")
+
     yield
 
-    # إيقاف التلغرام و cTrader عند إيقاف الخادم
+    # إيقاف الجدولة، التلغرام، cTrader، وقاعدة البيانات عند إيقاف الخادم
     stop_ctrader_flag = True
+    if scheduler:
+        scheduler.shutdown(wait=False)
     if telegram_app:
         try:
             await telegram_app.stop()
             await telegram_app.shutdown()
         except Exception as e:
             logger.error(f"Error shutting down Telegram App: {e}")
+    await db.close_db()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -830,7 +963,9 @@ async def root():
     return {
         "status": "online",
         "service": "AI Trading Assistant",
-        "ctrader_connected": is_ctrader_connected
+        "ctrader_connected": is_ctrader_connected,
+        "database_connected": db.pool is not None,
+        "auto_analysis_interval_minutes": db.AUTO_ANALYSIS_INTERVAL_MINUTES
     }
 
 @app.post(WEBHOOK_PATH)
