@@ -28,6 +28,7 @@ from twisted.internet import reactor
 from ctrader_open_api import Client, TcpProtocol
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiMessages_pb2 import *
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *  # تم إضافته: يحتوي على ProtoOATrendbarPeriod و ProtoOATradeSide
 
 # إعداد السجلات (Logging)
 logging.basicConfig(level=logging.INFO)
