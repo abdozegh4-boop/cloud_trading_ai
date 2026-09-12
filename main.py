@@ -35,7 +35,7 @@ logger = logging.getLogger("TradingBot")
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
@@ -70,9 +70,7 @@ trendbars_cache: Dict[str, Dict[str, Any]] = {}
 AVAILABLE_TIMEFRAMES = ["M15", "H1", "H4", "D1"]
 
 # تخزين اختيارات المستخدم الحالية (في الذاكرة)
-# user_selected_symbols: { user_id: ["EURUSD", "XAUUSD"] }
 user_selected_symbols: Dict[int, List[str]] = {}
-# user_selected_tfs: { user_id: ["H1", "H4"] }
 user_selected_tfs: Dict[int, List[str]] = {}
 
 ALL_AVAILABLE_SYMBOLS = {
@@ -103,7 +101,7 @@ async def fetch_finnhub_news() -> List[str]:
         async with httpx.AsyncClient(timeout=3.0) as http_client:
             resp = await http_client.get(url)
             if resp.status_code == 200:
-                articles = resp.json()[:4]
+                articles = resp.json()[:5]
                 return [f"- {item.get('headline')}: {item.get('summary')[:120]}..." for item in articles]
     except Exception as e:
         logger.error(f"Finnhub Fetch Error: {e}")
@@ -114,7 +112,7 @@ async def fetch_tradingview_rss() -> List[str]:
     try:
         loop = asyncio.get_running_loop()
         feed = await loop.run_in_executor(None, feedparser.parse, url)
-        return [f"- {entry.title}" for entry in feed.entries[:4]]
+        return [f"- {entry.title}: {entry.summary if hasattr(entry, 'summary') else ''}" for entry in feed.entries[:5]]
     except Exception as e:
         logger.error(f"TradingView RSS Fetch Error: {e}")
     return []
@@ -236,62 +234,73 @@ def ctrader_auto_reconnect_loop():
                 break
             time.sleep(1)
 
-# ==================== AI Analysis Engine ====================
+# ==================== AI Specific Analysis Prompts ====================
 
-async def generate_comprehensive_analysis(aggregated_data: Dict[str, Any], selected_tfs: List[str]) -> str:
+async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, Any], selected_tfs: List[str]) -> str:
     if not ai_client:
         return "❌ **خطأ:** مفتاح Google Gemini API غير متوفر."
 
     symbols_list_str = ", ".join(aggregated_data['symbols'])
     tfs_list_str = ", ".join(selected_tfs)
 
-    prompt = f"""
-    You are an elite Institutional Quantitative Analyst and Macro Trader.
-    Generate a complete, structured multi-asset trading recommendation report for ALL requested symbols:
-    
-    TARGET SYMBOLS: [{symbols_list_str}]
-    SHARED TIMEFRAMES FOR EACH SYMBOL: [{tfs_list_str}]
+    if analysis_type == "forex_factory":
+        prompt = f"""
+        You are a Senior Economic Analyst. Analyze the Forex Factory Calendar data for the requested symbols: [{symbols_list_str}]
+        Shared Timeframes: [{tfs_list_str}]
 
-    --- AGGREGATED MARKET DATA ---
-    1. **Forex Factory Calendar:**
-    {json.dumps(aggregated_data['forex_factory'], indent=2)}
+        Forex Factory Data:
+        {json.dumps(aggregated_data['forex_factory'], indent=2)}
 
-    2. **Finnhub Real-time News:**
-    {chr(10).join(aggregated_data['finnhub_news']) if aggregated_data['finnhub_news'] else 'No news available.'}
+        Provide a detailed Economic Calendar Analysis in Arabic covering:
+        1. Upcoming high-impact economic releases affecting [{symbols_list_str}].
+        2. Expected volatility levels during these news events.
+        3. Fundamental Bias (Positive / Negative / Neutral) for each symbol based strictly on the economic calendar.
+        """
 
-    3. **TradingView RSS Analysis:**
-    {chr(10).join(aggregated_data['tradingview_rss']) if aggregated_data['tradingview_rss'] else 'No RSS available.'}
+    elif analysis_type == "finnhub":
+        prompt = f"""
+        You are a Real-Time Financial News Analyst. Analyze the Finnhub Real-time News feed for the requested symbols: [{symbols_list_str}]
+        Shared Timeframes: [{tfs_list_str}]
 
-    --- INSTRUCTIONS ---
-    Provide a clear, detailed breakdown for EVERY single symbol in the target list [{symbols_list_str}].
-    Format the output cleanly in Telegram Markdown format (Arabic):
+        Finnhub News Data:
+        {chr(10).join(aggregated_data['finnhub_news']) if aggregated_data['finnhub_news'] else 'No news items available.'}
 
-    🎯 **تقرير التحليل الفني والاقتصادي الشامل والجامع**
+        Provide a Breaking News Analysis in Arabic covering:
+        1. Key market headlines impacting [{symbols_list_str}].
+        2. Short-term sentiment analysis (Bullish / Bearish sentiment score).
+        3. Immediate risks or catalysts to watch for the specified timeframes [{tfs_list_str}].
+        """
 
-    📌 **الأزواج المحللة:** {symbols_list_str}
-    ⏱️ **الأطر الزمنية المعتمدة لكل زوج:** {tfs_list_str}
+    elif analysis_type == "tradingview":
+        prompt = f"""
+        You are a Chief Technical Strategist. Analyze the TradingView RSS feed and Technical bar data for the requested symbols: [{symbols_list_str}]
+        Shared Timeframes: [{tfs_list_str}]
 
-    ───────────────────────────
-    (Repeat the block below for EACH symbol in [{symbols_list_str}]):
+        TradingView Feed:
+        {chr(10).join(aggregated_data['tradingview_rss']) if aggregated_data['tradingview_rss'] else 'No RSS items available.'}
 
-    🔹 **الأصل / الزوج:** [Symbol Name]
-    • **الفريمات المحددة:** {tfs_list_str}
-    
-    📈 **1. النظرة الفنية والتحليل الأخبارى:**
-    [دمج الأخبار والاتجاه لكل فريم زمن من الفريمات المحددة]
+        Provide a Technical Overview in Arabic covering:
+        1. Multi-timeframe trend outlook on [{tfs_list_str}] for each symbol in [{symbols_list_str}].
+        2. Major support and resistance zones identified.
+        3. Chart patterns or key breakout levels.
+        """
 
-    ⚡ **2. التوصية التنفيذية:**
-    • **نوع الخيار:** 🟢 شراء (BUY) / 🔴 بيع (SELL) / ⚪ محايد (NEUTRAL)
-    • **نقطة الدخول:** [Price]
-    • **هدف الربح (TP):** [Price]
-    • **وقف الخسارة (SL):** [Price]
-    • **نسبة المخاطرة إلى العائد:** [R:R Ratio]
+    else:  # All combined / Full recommendation
+        prompt = f"""
+        You are an Institutional Master Trader. Generate a Full Trading Recommendation report combining Economic Calendar, Real-time News, TradingView Feed, and Technicals for: [{symbols_list_str}]
+        Shared Timeframes: [{tfs_list_str}]
 
-    ───────────────────────────
+        --- AGGREGATED DATA ---
+        Calendar: {json.dumps(aggregated_data['forex_factory'], indent=2)}
+        News: {chr(10).join(aggregated_data['finnhub_news'])}
+        TradingView: {chr(10).join(aggregated_data['tradingview_rss'])}
 
-    💡 **توصيات إدارة المخاطر الإجمالية:**
-    [نصيحة عامة لتوزيع المخاطرة على الأزواج المختارة]
-    """
+        Provide a complete execution report in Arabic for EVERY symbol in [{symbols_list_str}]:
+        • Symbol Name & Timeframes
+        • Integrated Fundamental & Technical Assessment
+        • Signal: BUY / SELL / NEUTRAL
+        • Entry Price, Take Profit (TP), Stop Loss (SL), Risk/Reward Ratio
+        """
 
     try:
         response = ai_client.models.generate_content(
@@ -329,8 +338,18 @@ def main_keyboard(user_id: int):
         [
             InlineKeyboardButton(f"⏱️ الأطر الزمنية المشتركة ({tfs_count})", callback_data="open_timeframes_menu")
         ],
+        # أزرار التحليل المخصصة
         [
-            InlineKeyboardButton(f"🚀 توليد التوصية الموحدة ({syms_count} أزواج)", callback_data="run_multi_analysis")
+            InlineKeyboardButton("📅 تحليل التقويم (Forex Factory)", callback_data="analyze_forexfactory")
+        ],
+        [
+            InlineKeyboardButton("📰 تحليل الأخبار الفورية (Finnhub)", callback_data="analyze_finnhub")
+        ],
+        [
+            InlineKeyboardButton("📉 تحليل الرؤية الفنية (TradingView)", callback_data="analyze_tradingview")
+        ],
+        [
+            InlineKeyboardButton(f"🧠 التوصية الموحدة الشاملة ({syms_count} أزواج)", callback_data="run_full_analysis")
         ],
         [
             InlineKeyboardButton("📊 حالة النظام", callback_data="btn_status"),
@@ -393,10 +412,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_selected_tfs[user_id] = ["H1"]
 
     welcome_text = (
-        "🚀 **مرحباً بك في لوحة التداول والتحليل الذكية الموحدة!**\n\n"
-        "• قم باختيار **الأزواج المطلوب تحليلها** من الأقسام أدناه.\n"
-        "• اضبط **الأطر الزمنية المشتركة** التي تريد تطبيقها على جميع الأزواج.\n"
-        "• انقر على **توليد التوصية الموحدة** للحصول على تقرير شامل لكل أزواجك المختارة."
+        "🚀 **مرحباً بك في لوحة التداول الذكية المخصصة!**\n\n"
+        "• قم باختيار **الأزواج** و **الأطر الزمنية المشتركة**.\n"
+        "• يمكنك الآن الضغط على زر التحليل الخاص بكل مصدر (Forex Factory, Finnhub, TradingView) للحصول على تقرير مخصص، أو استخدام زر **التوصية الموحدة الشاملة**."
     )
     await update.message.reply_text(
         welcome_text,
@@ -419,7 +437,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     data = query.data
 
-    # تهيئة البيانات الافتراضية للمستخدم إن لم تكن موجودة
     if user_id not in user_selected_symbols:
         user_selected_symbols[user_id] = ["EURUSD"]
     if user_id not in user_selected_tfs:
@@ -433,7 +450,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "🤖 **لوحة التحكم الرئيسية**\n\n"
                 f"🔹 **الأزواج المختارة حالياً ({len(syms)}):** `{', '.join(syms) if syms else 'لا يوجد'}`\n"
                 f"⏱️ **الأطر الزمنية المشتركة ({len(tfs)}):** `{', '.join(tfs)}`\n\n"
-                "اختر الخيار المطلوب أدناه:"
+                "اختر نوع التحليل المطلوب أدناه:"
             )
             await query.edit_message_text(
                 text,
@@ -444,8 +461,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         elif data.startswith("category_"):
             category = data.split("_")[1]
             await query.edit_message_text(
-                f"📋 **اختر الأزواج المطلوبة ضمن فئة [{category.upper()}]:**\n"
-                f"*(يمكنك تحديد أكثر من زوج، سيتم حفظ الاختيارات تلقائياً)*",
+                f"📋 **اختر الأزواج المطلوبة ضمن فئة [{category.upper()}]:**",
                 reply_markup=symbol_picker_keyboard(user_id, category),
                 parse_mode="Markdown"
             )
@@ -465,8 +481,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif data == "open_timeframes_menu":
             await query.edit_message_text(
-                "⏱️ **اختر الأطر الزمنية المشتركة للتحليل:**\n"
-                "*(هذه الأطر ستطبق على كل الأزواج المحددة)*",
+                "⏱️ **اختر الأطر الزمنية المشتركة للتحليل:**",
                 reply_markup=shared_tf_keyboard(user_id),
                 parse_mode="Markdown"
             )
@@ -484,31 +499,38 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             user_selected_tfs[user_id] = current_tfs
             await query.edit_message_reply_markup(reply_markup=shared_tf_keyboard(user_id))
 
-        elif data == "run_multi_analysis":
+        # أزرار التحليل المخصصة
+        elif data in ["analyze_forexfactory", "analyze_finnhub", "analyze_tradingview", "run_full_analysis"]:
             selected_syms = user_selected_symbols.get(user_id, [])
             selected_tfs = user_selected_tfs.get(user_id, ["H1"])
 
             if not selected_syms:
                 await query.edit_message_text(
-                    "⚠️ **لم تقم باختيار أي زوج!**\nالرجاء اختيار زوج واحد على الأقل من القوائم للبدء.",
+                    "⚠️ **لم تقم باختيار أي زوج!**\nالرجاء اختيار زوج واحد على الأقل للبدء.",
                     reply_markup=main_keyboard(user_id),
                     parse_mode="Markdown"
                 )
                 return
 
-            syms_str = ", ".join(selected_syms)
-            tfs_str = ", ".join(selected_tfs)
+            type_labels = {
+                "analyze_forexfactory": ("📅 تحليل التقويم الاقتصادي (Forex Factory)", "forex_factory"),
+                "analyze_finnhub": ("📰 تحليل الأخبار الفورية (Finnhub)", "finnhub"),
+                "analyze_tradingview": ("📉 تحليل الرؤية الفنية (TradingView)", "tradingview"),
+                "run_full_analysis": ("🧠 التوصية الموحدة الشاملة", "full")
+            }
+
+            label_name, internal_type = type_labels[data]
 
             await query.edit_message_text(
-                f"⏳ **جاري تجميع البيانات والتحليل الموحد...**\n"
-                f"• **الأزواج Target:** `{syms_str}`\n"
-                f"• **الفريمات:** `{tfs_str}`\n\n"
-                f"🧠 **جاري المعالجة بواسطة الذكاء الاصطناعي...**",
+                f"⏳ **جاري جلب معطيات [{label_name}]...**\n"
+                f"• **الأزواج:** `{', '.join(selected_syms)}`\n"
+                f"• **الأطر الزمنية:** `{', '.join(selected_tfs)}`\n\n"
+                f"🧠 **جاري تحليل البيانات عبر Gemini AI...**",
                 parse_mode="Markdown"
             )
 
             aggregated = await aggregate_multi_symbols_data(selected_syms)
-            report = await generate_comprehensive_analysis(aggregated, selected_tfs)
+            report = await run_specific_analysis(internal_type, aggregated, selected_tfs)
             await query.message.reply_text(report, reply_markup=main_keyboard(user_id), parse_mode="Markdown")
 
         elif data == "btn_status":
@@ -518,11 +540,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"🔌 **شبكة cTrader API:** {ctrader_status}\n"
                 f"🧠 **النموذج النشط:** `{GEMINI_MODEL}`"
             )
-            await query.edit_message_text(
-                status_msg,
-                reply_markup=main_keyboard(user_id),
-                parse_mode="Markdown"
-            )
+            await query.edit_message_text(status_msg, reply_markup=main_keyboard(user_id), parse_mode="Markdown")
 
         elif data == "btn_account":
             request_account_details()
