@@ -35,7 +35,7 @@ logger = logging.getLogger("TradingBot")
 load_dotenv()
 
 # ==================== المتغيرات البيئية والإعدادات ====================
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 api_key = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
@@ -303,12 +303,18 @@ async def run_specific_analysis(analysis_type: str, aggregated_data: Dict[str, A
         """
 
     try:
-        response = ai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
+        # تشغيل استدعاء Gemini بشكل غير معطل (Non-Blocking) لمنع تجميد الخادم والتسبب بـ Timeout
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: ai_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
         )
         return response.text
     except Exception as e:
+        logger.error(f"Gemini Analysis Error: {e}")
         return f"❌ **خطأ أثناء توليد التحليل عبر الذكاء الاصطناعي:**\n`{str(e)}`"
 
 # ==================== لوحات التحكم والأزرار ====================
@@ -470,7 +476,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 )
 
         elif data.startswith("toggle_sym_"):
-            # المعالجة الآمنة لتقسيم callback_data
             parts = data.split("_")
             if len(parts) >= 4:
                 sym = parts[2]
@@ -530,6 +535,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
             label_name, internal_type = type_labels[data]
 
+            # 1. إظهار رسالة الانتظار فوراً للمستخدم
             await query.edit_message_text(
                 f"⏳ **جاري جلب معطيات [{label_name}]...**\n"
                 f"• **الأزواج:** `{', '.join(selected_syms)}`\n"
@@ -538,9 +544,25 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
-            aggregated = await aggregate_multi_symbols_data(selected_syms)
-            report = await run_specific_analysis(internal_type, aggregated, selected_tfs)
-            await query.message.reply_text(report, reply_markup=main_keyboard(user_id), parse_mode="Markdown")
+            # 2. جلب وتوليد البيانات بأسلوب غير معطل للـ Bot Async Execution
+            try:
+                aggregated = await aggregate_multi_symbols_data(selected_syms)
+                report = await run_specific_analysis(internal_type, aggregated, selected_tfs)
+                
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=report,
+                    reply_markup=main_keyboard(user_id),
+                    parse_mode="Markdown"
+                )
+            except Exception as ai_err:
+                logger.error(f"Analysis Execution Error: {ai_err}")
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"⚠️ **حدث خطأ أثناء إجراء التحليل:**\n`{str(ai_err)}`",
+                    reply_markup=main_keyboard(user_id),
+                    parse_mode="Markdown"
+                )
 
         elif data == "btn_status":
             ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
@@ -594,7 +616,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         logger.error(f"Error executing callback action for {data}: {e}")
         try:
-            await query.message.reply_text("⚠️ حدث خطأ غير متوقع، يرجى إعادة المحاولة.", reply_markup=main_keyboard(user_id))
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ **حدث خطأ غير متوقع:**\n`{str(e)}`",
+                reply_markup=main_keyboard(user_id)
+            )
         except Exception:
             pass
 
