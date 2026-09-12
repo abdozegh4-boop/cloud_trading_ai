@@ -33,7 +33,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 load_dotenv()
 
 # ==================== المتغيرات البيئية ====================
-GEMINI_MODEL = "gemini-2.5-flash"  # النموذج الرسمي السريع المتاح حالياً
+GEMINI_MODEL = "gemini-3.6-flash"  # تحديث النموذج إلى النسخة المعتمدة الحديثة
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
@@ -636,3 +636,10 @@ def update_symbols(data: UpdateSymbolsPayload):
         return {"status": "success", "category": data.category, "updated_symbols": data.symbols}
     else:
         raise HTTPException(status_code=500, detail="Failed to save symbols to database")
+
+# ==================== إعدادات التشغيل لـ Render ====================
+import uvicorn
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
