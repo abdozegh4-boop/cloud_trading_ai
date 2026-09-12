@@ -17,8 +17,12 @@ from telegram.ext import (
     ContextTypes
 )
 
-# استخدام SDK الجديدة الرسمية من Google
+# استخدام المكتبة الرسمية الجديدة لـ Gemini
 from google import genai
+
+# استخدام المكتبة الرسمية لـ cTrader Open API
+from ctrader_open_api import Client, Protobuf, TcpProtocol
+from ctrader_open_api.endpoints import Endpoints
 
 # =====================================================================
 # 1. الإعدادات العامة والتهيئات (Configurations)
@@ -29,29 +33,46 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# مفاتيح البيئة (Environment Variables)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "YOUR_FINNHUB_API_KEY")
 
+# بيانات cTrader Open API
+CTRADER_CLIENT_ID = os.getenv("CTRADER_CLIENT_ID", "YOUR_CTRADER_CLIENT_ID")
+CTRADER_CLIENT_SECRET = os.getenv("CTRADER_CLIENT_SECRET", "YOUR_CTRADER_CLIENT_SECRET")
+CTRADER_ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN", "YOUR_CTRADER_ACCESS_TOKEN")
+CTRADER_ACCOUNT_ID = int(os.getenv("CTRADER_ACCOUNT_ID", "12345678"))
+
+# تهيئة عميل Gemini SDK
 if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY":
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     gemini_client = genai.Client()
 
+# حالة إعدادات المستخدمين (في الذاكرة)
 USER_SETTINGS = {
     "selected_timeframes": ["M15", "H1", "H4"],
     "symbols_forex": ["EURUSD", "GBPUSD"]
 }
 
+TIMEFRAME_MAP = {
+    "M15": "M15",
+    "M30": "M30",
+    "H1": "H1",
+    "H4": "H4",
+    "D1": "D1"
+}
+
 # =====================================================================
-# 2. خادم HTTP خفيف لتفادي توقف الخدمة على Render
+# 2. خادم HTTP لتفادي توقف الخدمة على Render
 # =====================================================================
 
 fastapi_app = FastAPI()
 
 @fastapi_app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Bot & Analysis Engine is running fine!"}
+    return {"status": "ok", "message": "cTrader & Gemini Analysis Engine is running fine!"}
 
 def run_web_server():
     port = int(os.getenv("PORT", 8080))
@@ -60,10 +81,11 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # =====================================================================
-# 3. محرك الأخبار والتقويم الاقتصادي
+# 3. محرك الأخبار والتقويم الاقتصادي (News Engine)
 # =====================================================================
 
 async def get_forex_factory_calendar() -> str:
+    """جلب التقويم الاقتصادي والأحداث عالية التأثير من Forex Factory"""
     url = "https://nodedata.forexfactory.com/ff_calendar_thisweek.json"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -81,6 +103,7 @@ async def get_forex_factory_calendar() -> str:
     return "لا توجد أحداث عالية التأثير قريبة."
 
 async def get_finnhub_news() -> str:
+    """جلب الأخبار المالية المتخصصة من Finnhub"""
     if not FINNHUB_API_KEY or FINNHUB_API_KEY == "YOUR_FINNHUB_API_KEY":
         return "Finnhub API Key غير مفعّل."
     
@@ -98,6 +121,7 @@ async def get_finnhub_news() -> str:
     return "تعذر جلب أخبار Finnhub."
 
 def get_tradingview_rss() -> str:
+    """جلب العناوين العامة من TradingView RSS"""
     try:
         url = "https://www.tradingview.com/feed/"
         feed = feedparser.parse(url)
@@ -109,25 +133,102 @@ def get_tradingview_rss() -> str:
     return "تعذر جلب تغذية TradingView RSS."
 
 # =====================================================================
-# 4. جلب البيانات الفنية (cTrader Data Fetcher)
+# 4. محرك cTrader Open API الحقيقي (Real Market Data & Symbol ID)
 # =====================================================================
 
+async def get_symbol_id_by_name(client: Client, account_id: int, symbol_name: str) -> int:
+    """جلب Symbol ID الخاص بالشركة ديناميكياً"""
+    symbols_req = Protobuf.ProtoOASymbolsListReq()
+    symbols_req.ctidTraderAccountId = account_id
+    
+    response = await client.send(symbols_req)
+    
+    if hasattr(response, 'symbol'):
+        for sym in response.symbol:
+            if symbol_name.upper() in sym.symbolName.upper():
+                logging.info(f"✅ Symbol ID Found: {sym.symbolName} -> {sym.symbolId}")
+                return sym.symbolId
+    return None
+
 async def fetch_ctrader_data_for_timeframes(symbol: str, timeframes: List[str]) -> Dict[str, Any]:
+    """الاتصال بسيرفر cTrader وجلب الشموع والبيانات الفنية الفعلية"""
     market_data = {}
-    for tf in timeframes:
-        market_data[tf] = {
-            "close": 1.0850,
-            "atr": 0.0015,
-            "volume": 1250,
-            "trend": "Bullish" if tf in ["H1", "H4"] else "Bearish"
-        }
+    
+    # اختيار السيرفر Live أو Demo
+    host = Endpoints.PROTOBOL_HOST_LIVE
+    port = Endpoints.PROTOBOL_PORT
+    
+    client = Client(host, port, TcpProtocol)
+    
+    try:
+        await client.startService()
+        
+        # 1. App Authentication
+        auth_app = Protobuf.ProtoOAApplicationAuthReq()
+        auth_app.clientId = CTRADER_CLIENT_ID
+        auth_app.clientSecret = CTRADER_CLIENT_SECRET
+        await client.send(auth_app)
+        
+        # 2. Account Authentication
+        auth_acc = Protobuf.ProtoOAAccountAuthReq()
+        auth_acc.ctidTraderAccountId = CTRADER_ACCOUNT_ID
+        auth_acc.accessToken = CTRADER_ACCESS_TOKEN
+        await client.send(auth_acc)
+        
+        # 3. Dynamic Symbol ID Lookup
+        symbol_id = await get_symbol_id_by_name(client, CTRADER_ACCOUNT_ID, symbol)
+        if not symbol_id:
+            return {"error": f"Symbol {symbol} not found on broker."}
+            
+        # 4. Fetch Trendbars for each timeframe
+        for tf in timeframes:
+            if tf not in TIMEFRAME_MAP:
+                continue
+                
+            trendbar_req = Protobuf.ProtoOAGetTrendbarsReq()
+            trendbar_req.ctidTraderAccountId = CTRADER_ACCOUNT_ID
+            trendbar_req.symbolId = symbol_id
+            trendbar_req.period = TIMEFRAME_MAP[tf]
+            trendbar_req.count = 14
+            
+            response = await client.send(trendbar_req)
+            
+            if hasattr(response, 'trendbar') and len(response.trendbar) > 0:
+                bars = response.trendbar
+                last_bar = bars[-1]
+                
+                close_price = (last_bar.low + last_bar.deltaClose) / 100000.0
+                high_price = (last_bar.low + last_bar.deltaHigh) / 100000.0
+                low_price = last_bar.low / 100000.0
+                
+                prev_close = (bars[-2].low + bars[-2].deltaClose) / 100000.0 if len(bars) > 1 else close_price
+                trend = "Bullish" if close_price >= prev_close else "Bearish"
+                atr = round(abs(high_price - low_price), 5)
+                
+                market_data[tf] = {
+                    "close": round(close_price, 5),
+                    "atr": atr,
+                    "volume": last_bar.volume,
+                    "trend": trend
+                }
+            else:
+                market_data[tf] = {"status": "No data"}
+                
+    except Exception as e:
+        logging.error(f"⚠️ cTrader Connection Error: {e}")
+        for tf in timeframes:
+            market_data[tf] = {"error": "cTrader API connection issue"}
+    finally:
+        await client.stopService()
+        
     return market_data
 
 # =====================================================================
-# 5. تجميع السياق وتوليد التقرير عبر Gemini (gemini-2.0-flash)
+# 5. تجميع المعطيات وتوليد التقرير عبر Gemini 2.0 Flash
 # =====================================================================
 
 async def generate_analysis_report(symbol: str) -> str:
+    """تجميع البيانات الاقتصادية والفنية وإرسالها لـ Gemini"""
     selected_tfs = USER_SETTINGS.get("selected_timeframes", ["H1", "H4"])
     
     calendar_data, finnhub_data = await asyncio.gather(
@@ -149,7 +250,7 @@ async def generate_analysis_report(symbol: str) -> str:
 === 🌐 3. العناوين الاقتصادية العامة (TradingView RSS) ===
 {tradingview_data}
 
-=== 📈 4. البيانات الفنية للفريمات المختارة ({', '.join(selected_tfs)}) ===
+=== 📈 4. البيانات الفنية الحقيقية من cTrader ({', '.join(selected_tfs)}) ===
 {ctrader_data}
 
 === المطلوب ===
@@ -169,16 +270,16 @@ async def generate_analysis_report(symbol: str) -> str:
         return "حدث خطأ أثناء إعداد التحليل بواسطة الذكاء الاصطناعي."
 
 # =====================================================================
-# 6. واجهة تلغرام وإدارة الفريمات (Telegram Bot)
+# 6. واجهة تلغرام وبوت الإشارات (Telegram Bot Handlers)
 # =====================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("⏱ تعديل الفريمات الزمنية", callback_data="manage_timeframes")],
-        [InlineKeyboardButton("💱 تحليل EURUSD", callback_data="analyze_EURUSD")]
+        [InlineKeyboardButton("💱 تحليل EURUSD المباشر", callback_data="analyze_EURUSD")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("أهلاً بك في نظام التحليل الفني والمالي المتكامل. اختر من القائمة:", reply_markup=reply_markup)
+    await update.message.reply_text("أهلاً بك في نظام التحليل الفني والمالي المتكامل المرتبط بـ cTrader. اختر من القائمة:", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -221,7 +322,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"تم حفظ الفريمات بنجاح! الفريمات الحالية: {tfs_str}")
 
     elif query.data == "analyze_EURUSD":
-        await query.edit_message_text("⏳ جاري جلب التقويم الاقتصادي والأخبار وبيانات cTrader وتوليد التحليل...")
+        await query.edit_message_text("⏳ جاري الاتصال بـ cTrader وجلب الأخبار وتوليد التقرير بواسطة Gemini...")
         report = await generate_analysis_report("EURUSD")
         
         try:
@@ -230,19 +331,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(report)
 
 # =====================================================================
-# 7. التشغيل الرئيسي
+# 7. التشغيل الرئيسي (Main Entry Point)
 # =====================================================================
 
 def main():
     if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        raise ValueError("يرجى إدخال TELEGRAM_BOT_TOKEN الصحيح في متغيرات البيئة!")
+        raise ValueError("يرجى إدخال TELEGRAM_BOT_TOKEN في متغيرات البيئة!")
 
     telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
-    logging.info("تم تشغيل خادم الويب واستطلاع تلغرام بنجاح...")
+    logging.info("تم تشغيل الخدمة بنجاح واستقبال الطلبات...")
     telegram_app.run_polling()
 
 if __name__ == "__main__":
