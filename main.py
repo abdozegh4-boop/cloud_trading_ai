@@ -6,7 +6,7 @@ import time
 import httpx
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from contextlib import asynccontextmanager
@@ -33,7 +33,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 load_dotenv()
 
 # ==================== المتغيرات البيئية ====================
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = "gemini-2.5-flash"  # النموذج الرسمي السريع المتاح حالياً
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
@@ -60,7 +60,7 @@ db_pool: Optional[pool.SimpleConnectionPool] = None
 ctrader_account_info: Dict[str, Any] = {"balance": 0.0, "equity": 0.0, "margin": 0.0, "free_margin": 0.0}
 active_positions: List[Dict[str, Any]] = []
 
-# ==================== قائمة الشاملة بجميع الأزواج المتاحة في السوق ====================
+# ==================== قائمة الأزواج المتاحة ====================
 ALL_AVAILABLE_SYMBOLS = {
     "forex": [
         "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
@@ -77,7 +77,7 @@ ALL_AVAILABLE_SYMBOLS = {
     ]
 }
 
-# ذاكرة مؤقتة لتخزين تحديدات المستخدم أثناء تعديل القوائم
+# ذاكرة مؤقتة للتحديدات
 user_selections: Dict[int, Dict[str, Set[str]]] = {}
 
 # ==================== إدارة قاعدة البيانات ====================
@@ -304,7 +304,6 @@ def category_selection_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def build_symbols_checkbox_keyboard(category: str, selected_symbols: set):
-    """بناء لوحة أزرار تحتوي على مربعات تحديد للأزواج"""
     all_symbols = ALL_AVAILABLE_SYMBOLS.get(category, [])
     keyboard = []
     row = []
@@ -322,7 +321,6 @@ def build_symbols_checkbox_keyboard(category: str, selected_symbols: set):
     if row:
         keyboard.append(row)
 
-    # أزرار الإجراءات (تأكيد أو إلغاء)
     keyboard.append([
         InlineKeyboardButton("💾 حفظ التغييرات", callback_data=f"save_{category}"),
         InlineKeyboardButton("❌ إلغاء", callback_data="manage_categories")
@@ -392,7 +390,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     data = query.data
 
-    # --- العودة للقائمة الرئيسية ---
     if data == "back_main":
         await query.edit_message_text(
             "🤖 **مرحباً بك في لوحة التداول وتوصيات الذكاء الاصطناعي!**\n\n"
@@ -401,7 +398,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown"
         )
 
-    # --- إظهار قائمة اختيار الفئة للتعديل ---
     elif data == "manage_categories":
         await query.edit_message_text(
             "⚙️ **تعديل قائمة الأزواج المتاحة للبروكر**\n\n"
@@ -410,11 +406,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown"
         )
 
-    # --- عرض أزرار التحديد المباشرة للفئة المختارة ---
     elif data.startswith("editcat_"):
         category = data.split("_")[1]
-        
-        # جلب الأزواج الحالية المسجلة في DB لهذه الفئة
         current_db_symbols = set(get_broker_symbols_by_category(category, ALL_AVAILABLE_SYMBOLS.get(category, [])))
         
         if user_id not in user_selections:
@@ -429,12 +422,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown"
         )
 
-    # --- التبديل المباشر عند التحديد/الإلغاء (Toggle Checkbox) ---
     elif data.startswith("toggle_"):
         _, category, symbol = data.split("_")
         
-        if user_id not in user_selections or category not in user_selections[user_id]:
-            user_selections[user_id] = {category: set(get_broker_symbols_by_category(category, []))}
+        # حماية ضد إعادات التشغيل للجلسة
+        if user_id not in user_selections:
+            user_selections[user_id] = {}
+        if category not in user_selections[user_id]:
+            user_selections[user_id][category] = set(get_broker_symbols_by_category(category, ALL_AVAILABLE_SYMBOLS.get(category, [])))
 
         selected_set = user_selections[user_id][category]
         if symbol in selected_set:
@@ -445,7 +440,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         kb = build_symbols_checkbox_keyboard(category, selected_set)
         await query.edit_message_reply_markup(reply_markup=kb)
 
-    # --- حفظ التغييرات في قاعدة البيانات ---
     elif data.startswith("save_"):
         category = data.split("_")[1]
         selected_set = user_selections.get(user_id, {}).get(category, set())
@@ -468,35 +462,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
-    # --- توصيات الفوركس (قراءة ديناميكية من DB) ---
     elif data == "sig_forex":
         symbols = get_broker_symbols_by_category("forex", ["EURUSD", "GBPUSD", "USDJPY"])
         await query.message.reply_text(f"⏳ **جاري تحليل أزواج الفوركس المتاحة (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
         signals = await generate_market_signals("أزواج الفوركس", symbols)
         await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
 
-    # --- توصيات المعادن والطاقة ---
     elif data == "sig_commodities":
         symbols = get_broker_symbols_by_category("commodities", ["XAUUSD", "XAGUSD", "USOIL"])
         await query.message.reply_text(f"⏳ **جاري تحليل المعادن والطاقة (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
         signals = await generate_market_signals("المعادن والطاقة", symbols)
         await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
 
-    # --- توصيات المؤشرات ---
     elif data == "sig_indices":
         symbols = get_broker_symbols_by_category("indices", ["US30", "NAS100", "SPX500"])
         await query.message.reply_text(f"⏳ **جاري تحليل المؤشرات العالمية (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
         signals = await generate_market_signals("المؤشرات العالمية", symbols)
         await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
 
-    # --- توصيات الأسهم والعملات الرقمية ---
     elif data == "sig_crypto":
         symbols = get_broker_symbols_by_category("crypto", ["BTCUSD", "ETHUSD", "AAPL"])
         await query.message.reply_text(f"⏳ **جاري تحليل الأسهم والعملات الرقمية (`{', '.join(symbols)}`)...**", parse_mode="Markdown")
         signals = await generate_market_signals("الأسهم والعملات الرقمية", symbols)
         await query.message.reply_text(signals, reply_markup=main_keyboard(), parse_mode="Markdown")
 
-    # --- حالة النظام والتداول ---
     elif data == "btn_status":
         ctrader_status = "🟢 متصل" if is_ctrader_connected else "🔴 غير متصل"
         status_msg = (
@@ -566,6 +555,7 @@ async def lifespan(app: FastAPI):
 
     if TELEGRAM_BOT_TOKEN:
         try:
+            # إعداد البوت وربطه بالـ Async Loop الصريح لـ FastAPI
             telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
             
             telegram_app.add_handler(CommandHandler("start", cmd_start))
