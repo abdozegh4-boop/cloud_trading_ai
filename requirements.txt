@@ -1,6 +1,7 @@
-﻿fastapi
-uvicorn
+﻿google-genai
 python-telegram-bot
-google-genai
+fastapi
+uvicorn
 httpx
 feedparser
+ctrader-open-api
