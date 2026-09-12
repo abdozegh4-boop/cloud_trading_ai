@@ -22,7 +22,7 @@ from google import genai
 
 # استخدام المكتبة الرسمية لـ cTrader Open API
 from ctrader_open_api import Client, Protobuf, TcpProtocol
-from ctrader_open_api.endpoints import Endpoints
+from ctrader_open_api.endPoints import Endpoints
 
 # =====================================================================
 # 1. الإعدادات العامة والتهيئات (Configurations)
