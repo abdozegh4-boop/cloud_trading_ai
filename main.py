@@ -969,22 +969,30 @@ def on_message_received(client, message):
         scale = _account_money_scale()
         active_positions.clear()
         total_upnl = 0.0
+        total_used_margin = 0.0
+        missing_prices = False
         for pos in res.position:
             sym_name = symbol_id_to_name.get(pos.tradeData.symbolId, f"ID_{pos.tradeData.symbolId}")
-            upnl = getattr(pos, "unrealizedPnl", None)
-            try:
-                pnl_val = float(upnl) / scale if upnl is not None else 0.0
-            except Exception:
+            # PnL غير متوفر في ReconcileRes — يُحسب من سعر الدخول مقابل أحدث سعر
+            pnl_val = _compute_position_pnl(pos, sym_name)
+            if pnl_val is None:
                 pnl_val = 0.0
+                missing_prices = True
             total_upnl += pnl_val
+            # الهامش مستهلك لكل صفقة (usedMargin موجود في ProtoOAPosition)
+            um_pos = getattr(pos, "usedMargin", None)
+            try:
+                total_used_margin += float(um_pos) / scale if um_pos is not None else 0.0
+            except Exception:
+                pass
             sl_v = getattr(pos, "stopLoss", None)
             tp_v = getattr(pos, "takeProfit", None)
             try:
-                sl_f = float(sl_v) if sl_v not in (None, 0, 0.0) else None
+                sl_f = float(sl_v) / symbol_price_scale(sym_name) if sl_v not in (None, 0, 0.0) else None
             except Exception:
                 sl_f = None
             try:
-                tp_f = float(tp_v) if tp_v not in (None, 0, 0.0) else None
+                tp_f = float(tp_v) / symbol_price_scale(sym_name) if tp_v not in (None, 0, 0.0) else None
             except Exception:
                 tp_f = None
             active_positions.append({
@@ -993,29 +1001,28 @@ def on_message_received(client, message):
                 "trade_type": "BUY" if pos.tradeData.tradeSide == ProtoOATradeSide.BUY else "SELL",
                 # 1 lot = lotSize الرمز (FX رئيسية: 100,000 وحدة)
                 "volume": _volume_units_to_lots(pos.tradeData.volume, sym_name),
-                "entry_price": pos.price,
+                "entry_price": float(pos.price) / symbol_price_scale(sym_name),
                 "pnl": pnl_val,
                 "stop_loss": sl_f,
                 "take_profit": tp_f,
             })
+        # الهامش الإجمالي من الصفقات (ProtoOATrader لا يحتوي usedMargin)
+        if total_used_margin > 0:
+            ctrader_account_info["margin"] = round(total_used_margin, 2)
         # Equity تقريبي = Balance + Unrealized PnL
         bal = float(ctrader_account_info.get("balance") or 0.0)
         ctrader_account_info["equity"] = round(bal + total_upnl, 2)
-        if float(ctrader_account_info.get("margin") or 0) <= 0:
-            # بدون usedMargin من الوسيط: إن لا صفقات → هامش 0 وهامش حر = equity
-            if not active_positions:
-                ctrader_account_info["margin"] = 0.0
-                ctrader_account_info["free_margin"] = float(ctrader_account_info.get("equity") or bal)
-                ctrader_account_info["margin_level"] = 0.0
-            else:
-                # تقدير بسيط حتى تتوفر بيانات أدق
-                ctrader_account_info["free_margin"] = float(ctrader_account_info.get("equity") or bal)
-        else:
-            m = float(ctrader_account_info.get("margin") or 0)
-            e = float(ctrader_account_info.get("equity") or 0)
+        m = float(ctrader_account_info.get("margin") or 0)
+        e = float(ctrader_account_info.get("equity") or 0)
+        if m > 0:
             ctrader_account_info["free_margin"] = round(e - m, 2)
-            ctrader_account_info["margin_level"] = round((e / m) * 100.0, 2) if m > 0 else 0.0
+            ctrader_account_info["margin_level"] = round((e / m) * 100.0, 2)
+        else:
+            ctrader_account_info["free_margin"] = round(e, 2)
+            ctrader_account_info["margin_level"] = 0.0
         ctrader_account_info["updated_at"] = datetime.now(timezone.utc)
+        if missing_prices:
+            _request_missing_position_prices()
         logger.info(
             f"Account Reconciled: Balance ${ctrader_account_info['balance']}, "
             f"Equity ${ctrader_account_info.get('equity')}, "
@@ -1080,6 +1087,83 @@ def _account_money_scale() -> float:
         return 100.0
 
 
+def _latest_price_for_symbol(symbol: str) -> Optional[float]:
+    """أحدث سعر إغلاق معروف للرمز من شموع cTrader المخزنة (أحدث إطار زمني متوفر)."""
+    try:
+        tfs = trendbars_cache.get(symbol) or trendbars_cache.get(str(symbol).upper()) or {}
+        best: Optional[float] = None
+        best_ts: Optional[int] = None
+        for tf, bars in tfs.items():
+            if not bars:
+                continue
+            last_bar = bars[-1]
+            try:
+                close = (last_bar.low + last_bar.deltaClose) / symbol_price_scale(symbol)
+            except Exception:
+                continue
+            ts = int(getattr(last_bar, "timestamp", 0) or 0)
+            if best_ts is None or ts >= best_ts:
+                best_ts = ts
+                best = float(close)
+        return best
+    except Exception:
+        return None
+
+
+def _convert_pnl_to_account_currency(symbol: str, pnl_quote: float) -> float:
+    """
+    يحوّل ربح/خسارة عملة التسعير إلى عملة الحساب (يُفترض USD).
+    - الأزواج المنتهية بـ USD (EURUSD, XAUUSD, BTCUSD): مباشر.
+    - أزواج JPY (USDJPY): quote=JPY → نقسم على سعر USDJPY اللحظي.
+    """
+    try:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return pnl_quote
+        if sym.endswith("USD"):
+            return pnl_quote
+        if sym.endswith("JPY") and len(sym) >= 6:
+            rate = _latest_price_for_symbol("USD" + sym[-3:])
+            if rate and rate > 0:
+                return pnl_quote / rate
+        return pnl_quote
+    except Exception:
+        return pnl_quote
+
+
+def _compute_position_pnl(pos, symbol: str) -> Optional[float]:
+    """
+    يحسب الربح/الخسارة العائمة لصفقة من سعر الدخول مقابل أحدث سعر للحساب.
+    يعيد None إن لم يتوفر سعر لحظي للرمز بعد.
+    """
+    try:
+        side = pos.tradeData.tradeSide
+        direction = 1.0 if side == ProtoOATradeSide.BUY else -1.0
+        scale = symbol_price_scale(symbol)
+        entry = float(pos.price) / scale
+        cur = _latest_price_for_symbol(symbol)
+        if cur is None or cur <= 0:
+            return None
+        volume_units = float(pos.tradeData.volume)
+        pnl_quote = (cur - entry) * direction * volume_units
+        return _convert_pnl_to_account_currency(symbol, pnl_quote)
+    except Exception:
+        return None
+
+
+def _request_missing_position_prices() -> None:
+    """يطلب شموع لأي رمز ذي صفقة مفتوحة لم نحصل على سعره بعد (لحساب PnL)."""
+    try:
+        for pos in active_positions:
+            sym = pos.get("symbol")
+            if not sym or sym.startswith("ID_"):
+                continue
+            if _latest_price_for_symbol(sym) is None:
+                request_symbol_trendbars(sym, "M1")
+    except Exception as e:
+        logger.error(f"_request_missing_position_prices: {e}")
+
+
 def _apply_trader_account_info(trader) -> None:
     """يملأ ctrader_account_info من ProtoOATrader (أو كائن مشابه)."""
     digits = getattr(trader, "moneyDigits", None)
@@ -1095,19 +1179,8 @@ def _apply_trader_account_info(trader) -> None:
             ctrader_account_info["balance"] = float(bal) / scale
         except Exception:
             pass
-    # بعض الردود قد تتضمن usedMargin / freeMargin
-    um = getattr(trader, "usedMargin", None)
-    if um is not None:
-        try:
-            ctrader_account_info["margin"] = float(um) / scale
-        except Exception:
-            pass
-    fm = getattr(trader, "freeMargin", None)
-    if fm is not None:
-        try:
-            ctrader_account_info["free_margin"] = float(fm) / scale
-        except Exception:
-            pass
+    # ملاحظة: ProtoOATrader في ctrader-open-api 0.9.2 لا يحتوي على usedMargin/freeMargin.
+    # الهامش يُجمَّع من حقل usedMargin الخاص بكل صفقة في ProtoOAReconcileRes.
     lev = getattr(trader, "leverageInCents", None)
     if lev is None:
         lev = getattr(trader, "leverage", None)
