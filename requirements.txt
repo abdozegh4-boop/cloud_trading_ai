@@ -1,4 +1,4 @@
-﻿google-genai
+openai
 python-telegram-bot
 fastapi
 uvicorn
@@ -6,7 +6,8 @@ httpx
 feedparser
 ctrader-open-api
 service_identity
-psycopg2-binary
 python-dotenv
-asyncpg
 apscheduler
+redis
+google-cloud-bigquery
+google-cloud-firestore
