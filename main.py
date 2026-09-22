@@ -171,6 +171,79 @@ async def request_account_details_and_wait(timeout: Optional[float] = None) -> b
         return False
 
 
+def _account_snapshot_age() -> Optional[float]:
+    """عمر آخر لقطة حساب/صفقات بالثواني (None = لم يصل أي رد بعد)."""
+    upd = ctrader_account_info.get("updated_at")
+    if not upd:
+        return None
+    try:
+        now = datetime.now(timezone.utc)
+        return max(0.0, (now - upd).total_seconds())
+    except Exception:
+        return None
+
+
+def _format_snapshot_age(age_sec: Optional[float]) -> str:
+    if age_sec is None:
+        return "—"
+    if age_sec < 60:
+        return f"{int(age_sec)} ثانية"
+    if age_sec < 3600:
+        return f"{int(age_sec // 60)} دقيقة"
+    return f"{age_sec / 3600:.1f} ساعة"
+
+
+def _snapshot_source_label(snap: Dict[str, Any]) -> str:
+    """
+    ملصق مصدر البيانات لرسائل التيليجرام حتى يعرف المستخدم ما إذا كانت
+    البيانات لحظية من cTrader أم لقطة قديمة (احتياطية).
+    """
+    if snap.get("error") == "missing_credentials":
+        return "⚪ **المصدر:** غير مُهيّأ — متغيرات cTrader (CLIENT_ID/SECRET/ACCOUNT_ID) ناقصة"
+    if not snap.get("connected"):
+        return (
+            "🔴 **المصدر:** cTrader غير متصل الآن\n"
+            f"📍 تعرض آخر لقطة محفوظة (عمرها `{_format_snapshot_age(snap.get('age_sec'))}`)"
+        )
+    if snap.get("fresh"):
+        return "🟢 **المصدر:** cTrader مباشر (رد لحظي مؤكَّد)"
+    return (
+        "🟡 **المصدر:** cTrader متصل لكن الرد تأخّر\n"
+        f"📍 تعرض آخر لقطة محفوظة (عمرها `{_format_snapshot_age(snap.get('age_sec'))}`)"
+    )
+
+
+async def ensure_ctrader_live_snapshot(timeout: float = 12.0) -> Dict[str, Any]:
+    """
+    يضمن قراءة لقطة حديثة مباشرة من حساب cTrader (وليس من قاعدة البيانات/الكاش):
+      1) إن كان الاتصال مقطوعاً → يحفّز إعادة الاتصال وينتظر.
+      2) يرسل طلب الحساب/الصفقات وينتظر الرد الفعلي من cTrader.
+    يعيد {'ok', 'connected', 'fresh', 'age_sec', 'error'}.
+    """
+    if not (CLIENT_ID and CLIENT_SECRET and ACCOUNT_ID):
+        return {"ok": False, "connected": False, "fresh": False,
+                "age_sec": _account_snapshot_age(), "error": "missing_credentials"}
+
+    # 1) تأمين الاتصال قبل أي طلب
+    if not is_ctrader_connected:
+        try:
+            reactor.callFromThread(ctrader_client.startService)
+        except Exception as e:
+            logger.error(f"ensure live snapshot reconnect error: {e}")
+        deadline = time.time() + min(timeout, 8.0)
+        while not is_ctrader_connected and time.time() < deadline:
+            await asyncio.sleep(0.2)
+
+    if not is_ctrader_connected:
+        return {"ok": False, "connected": False, "fresh": False,
+                "age_sec": _account_snapshot_age(), "error": "not_connected"}
+
+    # 2) طلب لحظي + انتظار الرد الفعلي
+    fresh = await request_account_details_and_wait(timeout=timeout)
+    return {"ok": True, "connected": True, "fresh": fresh,
+            "age_sec": _account_snapshot_age(), "error": None}
+
+
 # بيانات الحساب والصفقات (المصدر: cTrader فقط)
 ctrader_account_info: Dict[str, Any] = {
     "balance": 0.0,
@@ -5939,10 +6012,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif data == "btn_account":
             await query.edit_message_text(
-                "⏳ **جاري جلب بيانات الحساب من cTrader...**",
+                "⏳ **جاري جلب بيانات الحساب مباشرةً من cTrader...**",
                 parse_mode="Markdown",
             )
-            await request_account_details_and_wait()
+            snap = await ensure_ctrader_live_snapshot()
             bal = ctrader_account_info.get("balance", 0.0)
             eq = ctrader_account_info.get("equity", 0.0)
             margin = ctrader_account_info.get("margin", 0.0)
@@ -5956,6 +6029,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             upd_s = upd.strftime("%H:%M:%S UTC") if upd else "—"
             msg = (
                 f"💳 **تقرير حساب التداول (cTrader لحظي):**\n\n"
+                f"{_snapshot_source_label(snap)}\n\n"
                 f"🔹 **الرصيد (Balance):** `${bal:,.2f}`\n"
                 f"🔹 **الصافي (Equity):** `${eq:,.2f}`\n"
                 f"🔹 **الأرباح/الخسائر:** `{pnl_sign}${pnl:,.2f}`\n"
@@ -5969,14 +6043,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif data == "btn_positions":
             await query.edit_message_text(
-                "⏳ **جاري مزامنة الصفقات من cTrader...**",
+                "⏳ **جاري مزامنة الصفقات مباشرةً من cTrader...**",
                 parse_mode="Markdown",
             )
-            await request_account_details_and_wait()
+            snap = await ensure_ctrader_live_snapshot()
+            src_line = _snapshot_source_label(snap)
             if not active_positions:
-                await query.edit_message_text("📭 **لا توجد صفقات مفتوحة حالياً.**", reply_markup=main_keyboard(user_id), parse_mode="Markdown")
+                await query.edit_message_text(
+                    f"📭 **لا توجد صفقات مفتوحة حالياً.**\n\n{src_line}",
+                    reply_markup=main_keyboard(user_id),
+                    parse_mode="Markdown",
+                )
             else:
-                msg = "📈 **الصفقات المفتوحة حالياً:**\n\n"
+                msg = f"📈 **الصفقات المفتوحة حالياً:**\n\n{src_line}\n\n"
                 for pos in active_positions:
                     side = "🟢 BUY" if pos.get("trade_type") == "BUY" else "🔴 SELL"
                     msg += (
