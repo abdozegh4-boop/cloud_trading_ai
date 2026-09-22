@@ -24,14 +24,17 @@ OLD_SCHEDULER_JOBS=(
   "trading-bot-keepalive:europe-west1"
 )
 
-# القيم الجديدة بعد التدوير (لا تضعها هنا لفترة طويلة — احذفها من الملف بعد التنفيذ)
-NEW_TELEGRAM_BOT_TOKEN="8624993506:AAHeDw-ZUkZ1fkU3Z5H6l3KFwnr118yms7I"
-NEW_NVIDIA_API_KEY="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"
-NEW_FINNHUB_API_KEY="dae8079r01ql3jf9a350dae8079r01ql3jf9a35g"
-NEW_CTRADER_CLIENT_SECRET="ZIWSeYB8Ug83R7tGHaPgpBnheCaeQkCZ92KUtONg8GDAoxMTp2"
-NEW_CTRADER_ACCESS_TOKEN="fvPWfwBJgna0TjfuF3hdM0LpG3dC_PwKFStCXUROO4g"
+# القيم الجديدة بعد التدوير — تُقرأ من متغيرات البيئة، لا تُكتب في الملف أبداً.
+# مرّرها هكذا قبل تشغيل السكربت:
+#   export NEW_TELEGRAM_BOT_TOKEN="..." NEW_NVIDIA_API_KEY="..." ...
+# أو اتركها فارغة لتخطّي إنشاء الأسرار (تُعاد استخدام الموجودة في Secret Manager).
+NEW_TELEGRAM_BOT_TOKEN="${NEW_TELEGRAM_BOT_TOKEN:-}"
+NEW_NVIDIA_API_KEY="${NEW_NVIDIA_API_KEY:-}"
+NEW_FINNHUB_API_KEY="${NEW_FINNHUB_API_KEY:-}"
+NEW_CTRADER_CLIENT_SECRET="${NEW_CTRADER_CLIENT_SECRET:-}"
+NEW_CTRADER_ACCESS_TOKEN="${NEW_CTRADER_ACCESS_TOKEN:-}"
 # لم نعد نستخدم Neon/PostgreSQL — التخزين على Firestore + BigQuery
-NEW_DATABASE_URL=""
+NEW_DATABASE_URL="${NEW_DATABASE_URL:-}"
 
 # متغيرات غير حساسة
 CTRADER_HOST="demo.ctraderapi.com"
